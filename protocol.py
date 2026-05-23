@@ -71,7 +71,10 @@ class USBProtocol(Protocol):
         if interface_data is None:
             raise ConnectionError("Interface data not found", -5, 6)
 
-        print(f"Found interface data: {interface_data.bInterfaceNumber}")
+        self.interface_number: int = interface_data.bInterfaceNumber
+        self.detached_kernel_driver = False
+
+        print(f"Found interface data: {self.interface_number}")
 
         endpoint_in = usb.util.find_descriptor(
             interface_data,
@@ -99,9 +102,9 @@ class USBProtocol(Protocol):
         self.endpoint_out: int = endpoint_out.bEndpointAddress
         print(f"Found endpoint out: {hex(self.endpoint_out)}")
 
-        if self.device.is_kernel_driver_active(
-                interface_data.bInterfaceNumber):
-            self.device.detach_kernel_driver(interface_data.bInterfaceNumber)
+        if self.device.is_kernel_driver_active(self.interface_number):
+            self.device.detach_kernel_driver(self.interface_number)
+            self.detached_kernel_driver = True
 
         self.device.set_configuration()
 
@@ -123,25 +126,18 @@ class USBProtocol(Protocol):
         return data
 
     def disconnect(self, timeout=5):
-
-        if timeout is not None:
-            timeout += time.time()
-
-        while True:
-            try:
-                usb.control.get_status(self.device)
-
-            except usb.core.USBError as error:
-                if (error.backend_error_code == -1
-                        or error.backend_error_code == -4):
-                    break
-
+        try:
+            usb.util.release_interface(self.device, self.interface_number)
+        except usb.core.USBError as error:
+            if error.backend_error_code not in (-4, -5):
                 raise error
-
-            if timeout is not None and time.time() > timeout:
-                raise TimeoutError("Device is still connected", -7, 110)
-
-            time.sleep(0.01)
+        finally:
+            if self.detached_kernel_driver:
+                try:
+                    self.device.attach_kernel_driver(self.interface_number)
+                except usb.core.USBError:
+                    pass
+            usb.util.dispose_resources(self.device)
 
 
 class SPIProtocol(Protocol):

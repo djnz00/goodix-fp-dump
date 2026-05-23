@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import socket
 import subprocess
+import time
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
@@ -20,6 +21,7 @@ class TLSServer:
     port: int = 4433
     bind: str = "127.0.0.1"
     openssl: str = "openssl"
+    startup_timeout: float = 2.0
     process: subprocess.Popen | None = field(default=None, init=False)
     transcript: bytes = field(default=b"", init=False)
 
@@ -41,6 +43,21 @@ class TLSServer:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
+        deadline = time.monotonic() + self.startup_timeout
+        while port_available(self.bind, self.port):
+            if self.process.poll() is not None:
+                output = b""
+                if self.process.stdout is not None:
+                    output = self.process.stdout.read() or b""
+                self.transcript += output
+                self.process = None
+                raise TLSServerError("TLS server exited before accepting connections")
+            if time.monotonic() >= deadline:
+                self.stop()
+                raise TLSServerError(
+                    f"TLS server did not bind {self.bind}:{self.port}"
+                )
+            time.sleep(0.02)
         return self
 
     @property
