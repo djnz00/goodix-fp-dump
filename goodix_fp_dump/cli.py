@@ -8,7 +8,11 @@ from pathlib import Path
 from .archive import ArchiveRun
 from .device_info import collect_preflight
 from .firmware_dump import dump_device_firmware
-from .production import read_production_data
+from .production import (
+    PRODUCTION_READ_VARIANTS,
+    probe_production_read_variants,
+    read_production_data,
+)
 from .tls_probe import probe_device_tls
 
 
@@ -60,6 +64,22 @@ def build_parser() -> argparse.ArgumentParser:
     production_read.add_argument("--timeout", type=float, default=5)
     production_read.add_argument("--arc", type=Path, default=Path("../arc"))
     production_read.add_argument("--no-usb-reset", action="store_true")
+
+    production_variants = subparsers.add_parser(
+        "read-production-variants",
+        help="probe read-only production-data command layouts",
+    )
+    production_variants.add_argument("--vendor", type=parse_int, default=0x27C6)
+    production_variants.add_argument("--product", type=parse_int, required=True)
+    production_variants.add_argument("--timeout", type=float, default=5)
+    production_variants.add_argument("--arc", type=Path, default=Path("../arc"))
+    production_variants.add_argument("--no-usb-reset", action="store_true")
+    production_variants.add_argument(
+        "--variant",
+        action="append",
+        choices=[variant.name for variant in PRODUCTION_READ_VARIANTS],
+        help="variant to probe; may be supplied more than once",
+    )
 
     return parser
 
@@ -135,6 +155,35 @@ def main(argv: list[str] | None = None) -> int:
             archive=archive,
             vendor=args.vendor,
             product=args.product,
+            reset_usb=not args.no_usb_reset,
+            timeout=args.timeout,
+        )
+        print(
+            json.dumps(
+                {
+                    "manifest": str(archive.manifest_path),
+                    "status": manifest["status"],
+                },
+                sort_keys=True,
+            )
+        )
+        return 0 if manifest["status"] == "ok" else 2
+
+    if args.command == "read-production-variants":
+        archive = ArchiveRun.create(args.arc, args.vendor, args.product)
+        variants_by_name = {
+            variant.name: variant for variant in PRODUCTION_READ_VARIANTS
+        }
+        variants = (
+            tuple(variants_by_name[name] for name in args.variant)
+            if args.variant
+            else PRODUCTION_READ_VARIANTS
+        )
+        manifest = probe_production_read_variants(
+            archive=archive,
+            vendor=args.vendor,
+            product=args.product,
+            variants=variants,
             reset_usb=not args.no_usb_reset,
             timeout=args.timeout,
         )

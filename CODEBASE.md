@@ -28,6 +28,12 @@ Classic family drivers `driver_51x0.py`, `driver_51x0_spi.py`, `driver_51x7.py`,
 
 `goodix_fp_dump/archive.py` creates controlled run directories and manifests. `device_info.py` records system and USB preflight facts. `firmware.py` and `safety.py` implement compatibility checks and destructive-operation gates. `image.py` validates image buffers before decoding, and `tls_proxy.py` wraps `openssl s_server` lifecycle management. Tests under `tests/` cover archive creation, preflight collection, OTP classification, safety gates, firmware compatibility, flash plans, image validation, TLS cleanup, and marker-based hardware/flash/manual skips. Default tests must not require hardware.
 
+### Phase 8 Goodix 521d findings
+
+Windows driver analysis of `Wbdi.dll` shows that `PresetPskReadSpecDataR` sends command `0xe4` with an 8-byte `{selector, 0}` request and expects a response shaped as `status + selector + length + payload`. The older Linux helper sends `length + offset + selector + 0`, so the stabilization package now includes `read-production-variants` to probe both layouts without printing raw production data. A 2026-05-23 hardware run against `27c6:521d` archived under `arc/20260523T212126Z-27c6-521d` returned the clean MCU negative `0x01 0x00` for all read variants and selectors.
+
+The same Windows path has a separate provisioning branch: when PSK validation fails, `PresetPskWriteKey` generates a random 32-byte PSK, stores a host-sealed `0xbb010002` TLV plus a whitebox-encrypted `0xbb010003` TLV through command `0xe0`, then validates by reading `0xbb020001` or `0xbb020007` before setting the in-memory TLS PSK. The current Linux TLS failure is therefore no longer explained by USB framing or TLS record movement alone; the remaining gap is reproducing the Windows provisioning/validation state machine safely.
+
 ### Firmware, logs, and Wireshark helpers
 
 The `firmware/` directory is a submodule containing device-family firmware blobs and metadata. `log/README.md` and `log/goodix_enable_logs.reg` document Windows-side logging artifacts. Lua dissectors in `wireshark/` decode Goodix messages for packet analysis; `wireshark/goodix_message.lua` contains protocol command annotations and parsing logic, and `wireshark/wrapless_goodix_message.lua` covers the wrapless message format.
