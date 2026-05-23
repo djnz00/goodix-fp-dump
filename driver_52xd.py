@@ -36,6 +36,11 @@ PSK_WHITE_BOX = bytes.fromhex(
 PMK_HASH = bytes.fromhex(
     "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925")
 
+PMK_HASH_10034 = bytes.fromhex(
+    "8b20e9bf659c6e34e27881612010b1b467c378f3e13334c57fb63fae960e7c89")
+
+VALID_PMK_HASHES = (PMK_HASH, PMK_HASH_10034)
+
 DEVICE_CONFIG = bytes.fromhex(
     "701160712c9d2cc91ce518fd00fd00fd03ba000180ca0008008400bec38600b1"
     "b68800baba8a00b3b38c00bcbc8e00b1b19000bbbb9200b1b194000000960000"
@@ -91,7 +96,7 @@ def check_psk(device: goodix.Device):
     if reply[1] != 0xbb020001:
         raise ValueError("Invalid flags")
 
-    return reply[2] == PMK_HASH
+    return reply[2] in VALID_PMK_HASHES
 
 
 def write_psk(device: goodix.Device):
