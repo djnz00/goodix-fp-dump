@@ -1,10 +1,10 @@
 ## Summary
 
-Research conducted on 2026-05-23 for the `goodix-fp-dump` checkout on branch `master`. No `source.yaml` was present in this repository, so this report uses a fresh repository source inventory of Python, shell, Lua, Markdown, requirements, logs metadata, and firmware submodule metadata. The project is a Python 3.10+ collection of Goodix fingerprint sensor tools. Top-level `run_<device>.py`, `dump_<device>.py`, and `flash_<device>.py` files dispatch into device-family driver modules. Shared transport, protocol, image, and firmware helpers live in `protocol.py`, `goodix.py`, `wrapless.py`, `tool.py`, `preprocessor.py`, `dumper_53x5.py`, and `flasher_53x5.py`.
+Research conducted on 2026-05-23 and refreshed for the `goodix-fp-dump` checkout on branch `stabilize-goodix-interoperability`. No `source.yaml` was present in this repository, so this report uses a fresh repository source inventory of Python, shell, Lua, Markdown, requirements, logs metadata, and firmware submodule metadata. The project is a Python 3.10+ collection of Goodix fingerprint sensor tools. Top-level `run_<device>.py`, `dump_<device>.py`, and `flash_<device>.py` files dispatch into device-family driver modules. Shared legacy transport, protocol, image, and firmware helpers live in `protocol.py`, `goodix.py`, `wrapless.py`, `tool.py`, `preprocessor.py`, `dumper_53x5.py`, and `flasher_53x5.py`; new phase work lives in the `goodix_fp_dump/` package.
 
 ## Coding style and conventions
 
-The code uses plain Python modules rather than a package directory. Device-family modules are named by product family, such as `driver_52xd.py`, `driver_53x5.py`, and `driver_55x4.py`; entrypoints are thin files named for product IDs, such as `run_521d.py` and `run_5395.py`. Functions use `snake_case`; protocol constants and byte blobs use uppercase names such as `PSK`, `DEVICE_CONFIG`, and `FIRMWARE_CHUNK_SIZE` (`driver_52xd.py:17`, `wrapless.py:15`). Some newer modules use type annotations (`protocol.py:13`, `wrapless.py:76`), while older driver modules mix typed signatures with untyped local code. Indentation is 4 spaces.
+The legacy code uses plain Python modules, while the stabilization branch adds a small `goodix_fp_dump/` package for shared archive, preflight, firmware, image, safety, and TLS-proxy services. Device-family modules are named by product family, such as `driver_52xd.py`, `driver_53x5.py`, and `driver_55x4.py`; entrypoints are thin files named for product IDs, such as `run_521d.py` and `run_5395.py`. Functions use `snake_case`; protocol constants and byte blobs use uppercase names such as `PSK`, `DEVICE_CONFIG`, and `FIRMWARE_CHUNK_SIZE` (`driver_52xd.py:17`, `wrapless.py:15`). New modules use type annotations where useful. Indentation is 4 spaces.
 
 ## Detailed Findings
 
@@ -24,6 +24,10 @@ Classic family drivers `driver_51x0.py`, `driver_51x0_spi.py`, `driver_51x7.py`,
 
 `dumper_53x5.py` reads IAP/app firmware, parses flash metadata, dumps OTP, USB PID, and option bytes (`dumper_53x5.py:18`, `dumper_53x5.py:29`, `dumper_53x5.py:50`, `dumper_53x5.py:104`, `dumper_53x5.py:116`). `flasher_53x5.py` provides a firmware update entrypoint (`flasher_53x5.py:8`). `tool.py` contains console warnings, TLS socket connection bridging, PGM image encode/decode helpers, and image file IO (`tool.py:7`, `tool.py:12`, `tool.py:36`, `tool.py:49`, `tool.py:61`). `preprocessor.py` implements crop, threshold, histogram, mean-filter, subtraction, and histogram equalization operations with a CLI (`preprocessor.py:6`, `preprocessor.py:14`, `preprocessor.py:28`, `preprocessor.py:51`, `preprocessor.py:104`).
 
+### Stabilization package and tests
+
+`goodix_fp_dump/archive.py` creates controlled run directories and manifests. `device_info.py` records system and USB preflight facts. `firmware.py` and `safety.py` implement compatibility checks and destructive-operation gates. `image.py` validates image buffers before decoding, and `tls_proxy.py` wraps `openssl s_server` lifecycle management. Tests under `tests/` cover archive creation, preflight collection, OTP classification, safety gates, firmware compatibility, flash plans, image validation, TLS cleanup, and marker-based hardware/flash/manual skips. Default tests must not require hardware.
+
 ### Firmware, logs, and Wireshark helpers
 
 The `firmware/` directory is a submodule containing device-family firmware blobs and metadata. `log/README.md` and `log/goodix_enable_logs.reg` document Windows-side logging artifacts. Lua dissectors in `wireshark/` decode Goodix messages for packet analysis; `wireshark/goodix_message.lua` contains protocol command annotations and parsing logic, and `wireshark/wrapless_goodix_message.lua` covers the wrapless message format.
@@ -42,7 +46,7 @@ The `firmware/` directory is a submodule containing device-family firmware blobs
 
 ## Architecture Documentation
 
-The project architecture is script-driven. Product-specific entrypoints choose a driver module and product ID. Driver modules open a transport through `protocol.py`, wrap that transport with either `goodix.Device` or `wrapless.Device`, then execute sensor initialization, PSK checks/writes, firmware operations, configuration upload, FDT scanning, and image handling. Shared tool modules convert raw image buffers to PGM-compatible formats and bridge TLS traffic through sockets when needed. The firmware submodule supplies binary inputs used by update and flash flows.
+The project architecture remains script-driven for compatibility. Product-specific entrypoints choose a driver module and product ID. Driver modules open a transport through `protocol.py`, wrap that transport with either `goodix.Device` or `wrapless.Device`, then execute sensor initialization, PSK checks/writes, firmware operations, configuration upload, FDT scanning, and image handling. New shared services in `goodix_fp_dump/` provide testable archive, preflight, TLS, image, firmware, and safety helpers without moving the legacy entrypoints. The firmware submodule supplies binary inputs used by update and flash flows.
 
 ## Open Questions
 
