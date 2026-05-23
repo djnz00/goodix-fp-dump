@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "goodix-fp-dump"
+version = "0.1.0"
+description = "Goodix fingerprint firmware dump and update tools"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+  "pyusb",
+  "crcmod",
+  "python-periphery",
+  "spidev",
+  "pycryptodome",
+  "crccheck",
+]
+
+[tool.setuptools]
+packages = ["goodix_fp_dump"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "unit: no-hardware unit tests",
+  "fixture: tests using synthetic or recorded fixtures",
+  "integration: local integration tests that avoid human action",
+  "hardware: tests requiring the local Goodix reader",
+  "flash: tests that may erase, write, or reflash firmware",
+  "manual: tests requiring human finger placement or judgment",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+extend-exclude = [
+  "firmware",
+  "log",
+  "wireshark",
+  "add_fp_5110.sh",
+  "driver_*.py",
+  "dump_*.py",
+  "flash_*.py",
+  "run_*.py",
+  "dumper_53x5.py",
+  "flasher_53x5.py",
+  "goodix.py",
+  "preprocessor.py",
+  "print_config_53x5.py",
+  "protocol.py",
+  "tool.py",
+  "wrapless.py",
+]
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]

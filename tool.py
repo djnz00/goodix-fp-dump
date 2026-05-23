@@ -2,6 +2,7 @@ import socket
 import time
 
 import goodix
+from goodix_fp_dump.image import decode_packed_image
 
 
 def warning(text: str):
@@ -34,16 +35,7 @@ def connect_device(device: goodix.Device, tls_client: socket.socket):
 
 
 def decode_image(data: bytes):
-    image: list[int] = []
-    for i in range(0, len(data), 6):
-        chunk = data[i:i + 6]
-
-        image.append(((chunk[0] & 0xf) << 8) + chunk[1])
-        image.append((chunk[3] << 4) + (chunk[0] >> 4))
-        image.append(((chunk[5] & 0xf) << 8) + chunk[2])
-        image.append((chunk[4] << 4) + (chunk[5] >> 4))
-
-    return image
+    return decode_packed_image(data)
 
 
 def write_pgm(image: list[int], width: int, height: int, path: str):

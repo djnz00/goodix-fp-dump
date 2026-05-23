@@ -3,9 +3,14 @@ import os
 
 import protocol
 import wrapless
+from goodix_fp_dump.safety import SafetyPlan
 
 
-def main(product: int, target_firmware_name: str):
+def main(product: int, target_firmware_name: str, safety_plan: SafetyPlan | None = None):
+    if safety_plan is None:
+        raise RuntimeError("firmware flashing requires a safety plan")
+    safety_plan.validate()
+
     if "DEBUG" in os.environ:
         logging.basicConfig(level=logging.DEBUG)
 

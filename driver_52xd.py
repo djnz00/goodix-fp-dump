@@ -1,14 +1,25 @@
 import hashlib
 import hmac
+import argparse
+import json
 import random
 import re
 import socket
 import struct
 import subprocess
+import time
 
 import goodix
 import protocol
 import tool
+from goodix_fp_dump.firmware import (
+    OTPReadResult,
+    build_flash_plan,
+    classify_otp,
+    classify_otp_error,
+)
+from goodix_fp_dump.safety import SafetyPlan
+from goodix_fp_dump.tls_proxy import TLSServer
 
 TARGET_FIRMWARE = "GFUSB_GM168SEC_APP_10019"
 IAP_FIRMWARE = "MILAN_GM168SEC_IAP_10007"
@@ -42,6 +53,27 @@ DEVICE_POV_CONFIG = bytes.fromhex(
 SENSOR_WIDTH = 80
 SENSOR_HEIGHT = 64
 
+ACTIVE_SAFETY_PLAN: SafetyPlan | None = None
+
+
+def set_safety_plan(plan: SafetyPlan | None):
+    global ACTIVE_SAFETY_PLAN
+    ACTIVE_SAFETY_PLAN = plan
+
+
+def require_destructive_operation(operation: str):
+    if ACTIVE_SAFETY_PLAN is None:
+        raise RuntimeError(f"{operation} requires a safety plan")
+    SafetyPlan(
+        target=ACTIVE_SAFETY_PLAN.target,
+        allow_write=ACTIVE_SAFETY_PLAN.allow_write,
+        confirmation=ACTIVE_SAFETY_PLAN.confirmation,
+        stock_dump_sha256=ACTIVE_SAFETY_PLAN.stock_dump_sha256,
+        firmware_family=ACTIVE_SAFETY_PLAN.firmware_family,
+        psk_evidence=ACTIVE_SAFETY_PLAN.psk_evidence,
+        operations=(operation,),
+    ).validate()
+
 
 def init_device(product: int):
     device = goodix.Device(product, protocol.USBProtocol)
@@ -63,6 +95,8 @@ def check_psk(device: goodix.Device):
 
 
 def write_psk(device: goodix.Device):
+    require_destructive_operation("write_psk")
+
     if not device.preset_psk_write(0xbb010003, PSK_WHITE_BOX, 114, 0,
                                    bytes.fromhex("56a5bb956b7c8d9e0000")):
         return False
@@ -74,10 +108,13 @@ def write_psk(device: goodix.Device):
 
 
 def erase_firmware(device: goodix.Device):
+    require_destructive_operation("erase_firmware")
     device.mcu_erase_app(50, True)
 
 
 def update_firmware(device: goodix.Device):
+    require_destructive_operation("update_firmware")
+
     firmware_file = open(f"firmware/52xd/{TARGET_FIRMWARE}.bin", "rb")
     firmware = firmware_file.read()
     firmware_file.close()
@@ -113,13 +150,60 @@ def update_firmware(device: goodix.Device):
     device.disconnect()
 
 
+def read_otp_diagnostics(device: goodix.Device, retries: int = 1, delay: float = 0.1):
+    errors = []
+    for attempt in range(retries + 1):
+        try:
+            result = classify_otp(device.read_otp())
+        except Exception as error:
+            result = classify_otp_error(error)
+            errors.append(result.as_dict())
+        else:
+            if result.ok or attempt == retries:
+                return result
+
+        if attempt < retries:
+            time.sleep(delay)
+
+    final = classify_otp_error(RuntimeError("OTP read failed"))
+    return OTPReadResult(
+        final.status,
+        error=final.error,
+        metadata={"attempts": retries + 1, "errors": errors},
+    )
+
+
+def read_only_probe(product: int):
+    device = init_device(product)
+    try:
+        firmware = None
+        valid_psk = None
+        try:
+            firmware = device.firmware_version()
+        except Exception as error:
+            firmware = {"error": str(error)}
+
+        try:
+            valid_psk = check_psk(device)
+        except Exception as error:
+            valid_psk = {"error": str(error)}
+
+        return {
+            "product": f"{product:04x}",
+            "path": "run_521d.py -> driver_52xd.py -> protocol.USBProtocol",
+            "firmware": firmware,
+            "valid_psk": valid_psk,
+            "otp": read_otp_diagnostics(device, retries=1).as_dict(),
+        }
+    finally:
+        try:
+            device.disconnect()
+        except Exception:
+            pass
+
+
 def run_driver(device: goodix.Device):
-    tls_server = subprocess.Popen([
-        "openssl", "s_server", "-nocert", "-psk",
-        PSK.hex(), "-port", "4433", "-quiet"
-    ],
-                                  stdout=subprocess.PIPE,
-                                  stderr=subprocess.STDOUT)
+    tls_server = TLSServer(PSK.hex()).start()
 
     try:
         if not device.reset(True, False, 20)[0]:
@@ -308,7 +392,7 @@ def run_driver(device: goodix.Device):
         finally:
             tls_client.close()
     finally:
-        tls_server.terminate()
+        tls_server.stop()
 
 
 def main(product: int):
@@ -370,3 +454,49 @@ def main(product: int):
             "Invalid firmware\n" +
             tool.warning("Please consider that removing this security "
                          "is a very bad idea!"))
+
+
+def cli(product: int):
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--allow-write",
+        action="store_true",
+        help="run the legacy destructive firmware path after confirmation",
+    )
+    parser.add_argument("--confirm")
+    parser.add_argument("--stock-dump-sha256")
+    parser.add_argument("--firmware-family", default="52xd")
+    parser.add_argument("--psk-evidence", action="store_true")
+    parser.add_argument(
+        "--read-only",
+        action="store_true",
+        default=True,
+        help="run safe firmware/OTP diagnostics only",
+    )
+    args = parser.parse_args()
+
+    if args.allow_write:
+        build_flash_plan(
+            product=product,
+            firmware_family=args.firmware_family,
+            target=f"27c6:{product:04x}",
+            stock_dump_sha256=args.stock_dump_sha256 or "",
+            confirmation=args.confirm or "",
+            psk_evidence=args.psk_evidence,
+            operations=("erase_firmware", "write_psk", "update_firmware"),
+        )
+        set_safety_plan(
+            SafetyPlan(
+                target=f"27c6:{product:04x}",
+                allow_write=True,
+                confirmation=args.confirm,
+                stock_dump_sha256=args.stock_dump_sha256,
+                firmware_family=args.firmware_family,
+                psk_evidence=args.psk_evidence,
+                operations=("erase_firmware", "write_psk", "update_firmware"),
+            )
+        )
+        main(product)
+        return
+
+    print(json.dumps(read_only_probe(product), indent=2, sort_keys=True))
