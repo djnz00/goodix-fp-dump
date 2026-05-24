@@ -1,0 +1,1098 @@
+// ==WindhawkMod==
+// @id              goodix-winusb-dump
+// @name            Goodix WinUSB dump
+// @description     Dump WinUSB buffers from the Goodix UMDF driver host.
+// @version         0.2
+// @author          local
+// @include         WUDFHost.exe
+// @architecture    x86-64
+// @compilerOptions -Wl,--export-all-symbols
+// ==/WindhawkMod==
+
+#include <windows.h>
+
+typedef void* WINUSB_INTERFACE_HANDLE;
+
+typedef struct _WINUSB_SETUP_PACKET {
+    UCHAR RequestType;
+    UCHAR Request;
+    USHORT Value;
+    USHORT Index;
+    USHORT Length;
+} WINUSB_SETUP_PACKET;
+
+typedef BOOL(WINAPI* WinUsb_ReadPipe_t)(WINUSB_INTERFACE_HANDLE, UCHAR, PUCHAR,
+                                        ULONG, PULONG, LPOVERLAPPED);
+typedef BOOL(WINAPI* WinUsb_WritePipe_t)(WINUSB_INTERFACE_HANDLE, UCHAR, PUCHAR,
+                                         ULONG, PULONG, LPOVERLAPPED);
+typedef BOOL(WINAPI* WinUsb_ControlTransfer_t)(WINUSB_INTERFACE_HANDLE,
+                                               WINUSB_SETUP_PACKET, PUCHAR,
+                                               ULONG, PULONG, LPOVERLAPPED);
+typedef BOOL(WINAPI* WinUsb_GetOverlappedResult_t)(WINUSB_INTERFACE_HANDLE,
+                                                   LPOVERLAPPED, LPDWORD, BOOL);
+typedef BOOL(WINAPI* GetOverlappedResult_t)(HANDLE, LPOVERLAPPED, LPDWORD, BOOL);
+typedef BOOL(WINAPI* GetQueuedCompletionStatus_t)(HANDLE, LPDWORD, PULONG_PTR,
+                                                  LPOVERLAPPED*, DWORD);
+typedef BOOL(WINAPI* GetQueuedCompletionStatusEx_t)(HANDLE, LPOVERLAPPED_ENTRY,
+                                                    ULONG, PULONG, DWORD, BOOL);
+typedef DWORD(WINAPI* WaitForSingleObject_t)(HANDLE, DWORD);
+typedef DWORD(WINAPI* WaitForSingleObjectEx_t)(HANDLE, DWORD, BOOL);
+typedef DWORD(WINAPI* WaitForMultipleObjects_t)(DWORD, const HANDLE*, BOOL,
+                                                DWORD);
+typedef DWORD(WINAPI* WaitForMultipleObjectsEx_t)(DWORD, const HANDLE*, BOOL,
+                                                  DWORD, BOOL);
+
+static WinUsb_ReadPipe_t WinUsb_ReadPipe_Original;
+static WinUsb_WritePipe_t WinUsb_WritePipe_Original;
+static WinUsb_ControlTransfer_t WinUsb_ControlTransfer_Original;
+static WinUsb_GetOverlappedResult_t WinUsb_GetOverlappedResult_Original;
+static GetOverlappedResult_t Kernel32_GetOverlappedResult_Original;
+static GetOverlappedResult_t KernelBase_GetOverlappedResult_Original;
+static GetQueuedCompletionStatus_t Kernel32_GetQueuedCompletionStatus_Original;
+static GetQueuedCompletionStatus_t KernelBase_GetQueuedCompletionStatus_Original;
+static GetQueuedCompletionStatusEx_t Kernel32_GetQueuedCompletionStatusEx_Original;
+static GetQueuedCompletionStatusEx_t KernelBase_GetQueuedCompletionStatusEx_Original;
+static WaitForSingleObject_t Kernel32_WaitForSingleObject_Original;
+static WaitForSingleObject_t KernelBase_WaitForSingleObject_Original;
+static WaitForSingleObjectEx_t Kernel32_WaitForSingleObjectEx_Original;
+static WaitForSingleObjectEx_t KernelBase_WaitForSingleObjectEx_Original;
+static WaitForMultipleObjects_t Kernel32_WaitForMultipleObjects_Original;
+static WaitForMultipleObjects_t KernelBase_WaitForMultipleObjects_Original;
+static WaitForMultipleObjectsEx_t Kernel32_WaitForMultipleObjectsEx_Original;
+static WaitForMultipleObjectsEx_t KernelBase_WaitForMultipleObjectsEx_Original;
+
+static const DWORD kMaxCaptureBytes = 1024 * 1024;
+static const wchar_t* kRoot = L"C:\\goodix-capture\\windhawk-winusb";
+static const wchar_t* kBuffers = L"C:\\goodix-capture\\windhawk-winusb\\buffers";
+static const wchar_t* kEvents = L"C:\\goodix-capture\\windhawk-winusb\\events.jsonl";
+
+struct PendingTransfer {
+    LPOVERLAPPED overlapped;
+    HANDLE eventHandle;
+    PUCHAR buffer;
+    ULONG requestedLength;
+    UCHAR pipeId;
+    bool inUse;
+    char api[32];
+    char direction[16];
+    wchar_t apiW[32];
+    wchar_t directionW[16];
+};
+
+struct CaptureItem {
+    CaptureItem* next;
+    LONG seq;
+    DWORD pid;
+    DWORD tid;
+    char utc[40];
+    char api[32];
+    char direction[16];
+    wchar_t apiW[32];
+    wchar_t directionW[16];
+    UCHAR pipeId;
+    DWORD requestedLength;
+    DWORD actualLength;
+    BOOL ok;
+    DWORD lastError;
+    bool pending;
+    BYTE data[1];
+};
+
+static volatile LONG g_sequence;
+static volatile LONG g_acceptingCaptures;
+static volatile LONG g_workerStop;
+static CRITICAL_SECTION g_lock;
+static bool g_lockReady;
+static HANDLE g_queueEvent;
+static HANDLE g_workerThread;
+static CaptureItem* g_queueHead;
+static CaptureItem* g_queueTail;
+static PendingTransfer g_pending[128];
+
+static void CopyAnsi(char* dst, DWORD dstChars, const char* src) {
+    if (!dst || dstChars == 0) {
+        return;
+    }
+
+    DWORD i = 0;
+    while (src && src[i] && i + 1 < dstChars) {
+        dst[i] = src[i];
+        i++;
+    }
+
+    dst[i] = 0;
+}
+
+static void CopyWide(wchar_t* dst, DWORD dstChars, const wchar_t* src) {
+    if (!dst || dstChars == 0) {
+        return;
+    }
+
+    DWORD i = 0;
+    while (src && src[i] && i + 1 < dstChars) {
+        dst[i] = src[i];
+        i++;
+    }
+
+    dst[i] = 0;
+}
+
+static void EnsureCaptureDirs() {
+    CreateDirectoryW(L"C:\\goodix-capture", nullptr);
+    CreateDirectoryW(kRoot, nullptr);
+    CreateDirectoryW(kBuffers, nullptr);
+}
+
+static void GetUtcTimestamp(char* buffer, DWORD chars) {
+    if (!buffer || chars == 0) {
+        return;
+    }
+
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    wsprintfA(buffer, "%04u-%02u-%02uT%02u:%02u:%02u.%03uZ", st.wYear,
+              st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+              st.wMilliseconds);
+}
+
+static void WideToUtf8(const wchar_t* src, char* dst, DWORD dstBytes) {
+    if (!dst || dstBytes == 0) {
+        return;
+    }
+
+    dst[0] = 0;
+    if (!src) {
+        return;
+    }
+
+    WideCharToMultiByte(CP_UTF8, 0, src, -1, dst, dstBytes, nullptr, nullptr);
+    dst[dstBytes - 1] = 0;
+}
+
+static void JsonEscape(const char* src, char* dst, DWORD dstBytes) {
+    if (!dst || dstBytes == 0) {
+        return;
+    }
+
+    DWORD out = 0;
+    for (DWORD i = 0; src && src[i] && out + 1 < dstBytes; i++) {
+        char c = src[i];
+        if ((c == '\\' || c == '"') && out + 2 < dstBytes) {
+            dst[out++] = '\\';
+            dst[out++] = c;
+        } else if (c == '\r' && out + 2 < dstBytes) {
+            dst[out++] = '\\';
+            dst[out++] = 'r';
+        } else if (c == '\n' && out + 2 < dstBytes) {
+            dst[out++] = '\\';
+            dst[out++] = 'n';
+        } else {
+            dst[out++] = c;
+        }
+    }
+
+    dst[out] = 0;
+}
+
+static void WriteAll(HANDLE file, const void* data, DWORD bytes) {
+    const BYTE* p = static_cast<const BYTE*>(data);
+    DWORD remaining = bytes;
+
+    while (remaining > 0) {
+        DWORD written = 0;
+        if (!WriteFile(file, p, remaining, &written, nullptr) || written == 0) {
+            return;
+        }
+
+        p += written;
+        remaining -= written;
+    }
+}
+
+static bool WriteBinaryFile(const wchar_t* path, const BYTE* buffer, DWORD length) {
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    if (buffer && length > 0) {
+        WriteAll(file, buffer, length);
+    }
+
+    CloseHandle(file);
+    return true;
+}
+
+static char HexChar(BYTE value) {
+    value &= 0x0f;
+    return static_cast<char>(value < 10 ? '0' + value : 'a' + (value - 10));
+}
+
+static void WriteHexFile(const wchar_t* path, const BYTE* buffer, DWORD length) {
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    for (DWORD offset = 0; offset < length; offset += 16) {
+        char line[96];
+        int pos = wsprintfA(line, "%08lx  ", offset);
+
+        for (DWORD i = 0; i < 16; i++) {
+            if (offset + i < length) {
+                BYTE b = buffer[offset + i];
+                line[pos++] = HexChar(b >> 4);
+                line[pos++] = HexChar(b);
+            } else {
+                line[pos++] = ' ';
+                line[pos++] = ' ';
+            }
+            line[pos++] = (i == 7) ? '-' : ' ';
+        }
+
+        line[pos++] = ' ';
+        for (DWORD i = 0; i < 16 && offset + i < length; i++) {
+            BYTE b = buffer[offset + i];
+            line[pos++] = (b >= 0x20 && b <= 0x7e) ? static_cast<char>(b) : '.';
+        }
+        line[pos++] = '\r';
+        line[pos++] = '\n';
+
+        WriteAll(file, line, static_cast<DWORD>(pos));
+    }
+
+    CloseHandle(file);
+}
+
+static void AppendEventJson(const CaptureItem* item,
+                            const wchar_t* binPath,
+                            const wchar_t* hexPath) {
+    char binUtf8[MAX_PATH * 3];
+    char hexUtf8[MAX_PATH * 3];
+    char binJson[MAX_PATH * 3 * 2];
+    char hexJson[MAX_PATH * 3 * 2];
+    char line[2048];
+
+    WideToUtf8(binPath, binUtf8, sizeof(binUtf8));
+    WideToUtf8(hexPath, hexUtf8, sizeof(hexUtf8));
+    JsonEscape(binUtf8, binJson, sizeof(binJson));
+    JsonEscape(hexUtf8, hexJson, sizeof(hexJson));
+
+    int len = wsprintfA(
+        line,
+        "{\"seq\":%ld,\"utc\":\"%s\",\"pid\":%lu,\"tid\":%lu,"
+        "\"api\":\"%s\",\"direction\":\"%s\",\"pipe\":%u,"
+        "\"requested_len\":%lu,\"actual_len\":%lu,\"ok\":%s,"
+        "\"last_error\":%lu,\"pending\":%s,\"buffer_bin\":\"%s\","
+        "\"buffer_hex\":\"%s\"}\r\n",
+        item->seq, item->utc, item->pid, item->tid, item->api,
+        item->direction, item->pipeId, item->requestedLength,
+        item->actualLength, item->ok ? "true" : "false", item->lastError,
+        item->pending ? "true" : "false", binJson, hexJson);
+
+    HANDLE file = CreateFileW(kEvents, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    WriteAll(file, line, static_cast<DWORD>(len));
+    CloseHandle(file);
+}
+
+static CaptureItem* PopCapture() {
+    if (!g_lockReady) {
+        return nullptr;
+    }
+
+    EnterCriticalSection(&g_lock);
+    CaptureItem* item = g_queueHead;
+    if (item) {
+        g_queueHead = item->next;
+        if (!g_queueHead) {
+            g_queueTail = nullptr;
+        }
+        item->next = nullptr;
+    }
+    LeaveCriticalSection(&g_lock);
+
+    return item;
+}
+
+static bool QueueIsEmpty() {
+    if (!g_lockReady) {
+        return true;
+    }
+
+    EnterCriticalSection(&g_lock);
+    bool empty = g_queueHead == nullptr;
+    LeaveCriticalSection(&g_lock);
+    return empty;
+}
+
+static void WriteCaptureItem(CaptureItem* item) {
+    if (!item) {
+        return;
+    }
+
+    EnsureCaptureDirs();
+
+    wchar_t binPath[MAX_PATH];
+    wchar_t hexPath[MAX_PATH];
+
+    wsprintfW(binPath, L"%s\\p%lu-t%lu-%06ld-%s-%s-pipe%02x-len%06lu.bin",
+              kBuffers, item->pid, item->tid, item->seq, item->directionW,
+              item->apiW, item->pipeId, item->actualLength);
+    wsprintfW(hexPath, L"%s\\p%lu-t%lu-%06ld-%s-%s-pipe%02x-len%06lu.hex",
+              kBuffers, item->pid, item->tid, item->seq, item->directionW,
+              item->apiW, item->pipeId, item->actualLength);
+
+    WriteBinaryFile(binPath, item->data, item->actualLength);
+    WriteHexFile(hexPath, item->data, item->actualLength);
+    AppendEventJson(item, binPath, hexPath);
+}
+
+static DWORD WINAPI CaptureWorkerThread(void*) {
+    while (true) {
+        WaitForSingleObject(g_queueEvent, INFINITE);
+
+        CaptureItem* item = nullptr;
+        while ((item = PopCapture()) != nullptr) {
+            WriteCaptureItem(item);
+            HeapFree(GetProcessHeap(), 0, item);
+        }
+
+        if (InterlockedCompareExchange(&g_workerStop, 0, 0) && QueueIsEmpty()) {
+            break;
+        }
+    }
+
+    return 0;
+}
+
+static void EnqueueBuffer(const char* api,
+                          const wchar_t* apiW,
+                          const char* direction,
+                          const wchar_t* directionW,
+                          UCHAR pipeId,
+                          const BYTE* buffer,
+                          DWORD requestedLength,
+                          DWORD actualLength,
+                          BOOL ok,
+                          DWORD lastError,
+                          bool pending) {
+    DWORD savedLastError = GetLastError();
+
+    if (!buffer || actualLength == 0 || actualLength > kMaxCaptureBytes ||
+        !g_lockReady || !g_queueEvent ||
+        !InterlockedCompareExchange(&g_acceptingCaptures, 0, 0)) {
+        SetLastError(savedLastError);
+        return;
+    }
+
+    SIZE_T allocSize = sizeof(CaptureItem) + actualLength - 1;
+    CaptureItem* item = static_cast<CaptureItem*>(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, allocSize));
+    if (!item) {
+        SetLastError(savedLastError);
+        return;
+    }
+
+    item->seq = InterlockedIncrement(&g_sequence);
+    item->pid = GetCurrentProcessId();
+    item->tid = GetCurrentThreadId();
+    item->pipeId = pipeId;
+    item->requestedLength = requestedLength;
+    item->actualLength = actualLength;
+    item->ok = ok;
+    item->lastError = lastError;
+    item->pending = pending;
+    GetUtcTimestamp(item->utc, ARRAYSIZE(item->utc));
+    CopyAnsi(item->api, ARRAYSIZE(item->api), api);
+    CopyAnsi(item->direction, ARRAYSIZE(item->direction), direction);
+    CopyWide(item->apiW, ARRAYSIZE(item->apiW), apiW);
+    CopyWide(item->directionW, ARRAYSIZE(item->directionW), directionW);
+    CopyMemory(item->data, buffer, actualLength);
+
+    EnterCriticalSection(&g_lock);
+    if (g_queueTail) {
+        g_queueTail->next = item;
+    } else {
+        g_queueHead = item;
+    }
+    g_queueTail = item;
+    LeaveCriticalSection(&g_lock);
+
+    SetEvent(g_queueEvent);
+    SetLastError(savedLastError);
+}
+
+static void RememberPending(LPOVERLAPPED overlapped,
+                            PUCHAR buffer,
+                            ULONG requestedLength,
+                            UCHAR pipeId,
+                            const char* api,
+                            const wchar_t* apiW,
+                            const char* direction,
+                            const wchar_t* directionW) {
+    DWORD savedLastError = GetLastError();
+
+    if (!overlapped || !buffer || !g_lockReady) {
+        SetLastError(savedLastError);
+        return;
+    }
+
+    EnterCriticalSection(&g_lock);
+
+    DWORD slot = 0;
+    for (; slot < ARRAYSIZE(g_pending); slot++) {
+        if (!g_pending[slot].inUse || g_pending[slot].overlapped == overlapped) {
+            break;
+        }
+    }
+
+    if (slot < ARRAYSIZE(g_pending)) {
+        g_pending[slot].overlapped = overlapped;
+        g_pending[slot].eventHandle = overlapped->hEvent;
+        g_pending[slot].buffer = buffer;
+        g_pending[slot].requestedLength = requestedLength;
+        g_pending[slot].pipeId = pipeId;
+        g_pending[slot].inUse = true;
+        CopyAnsi(g_pending[slot].api, ARRAYSIZE(g_pending[slot].api), api);
+        CopyAnsi(g_pending[slot].direction, ARRAYSIZE(g_pending[slot].direction),
+                 direction);
+        CopyWide(g_pending[slot].apiW, ARRAYSIZE(g_pending[slot].apiW), apiW);
+        CopyWide(g_pending[slot].directionW,
+                 ARRAYSIZE(g_pending[slot].directionW), directionW);
+    }
+
+    LeaveCriticalSection(&g_lock);
+    SetLastError(savedLastError);
+}
+
+static bool TakePending(LPOVERLAPPED overlapped, PendingTransfer* out) {
+    DWORD savedLastError = GetLastError();
+
+    if (!overlapped || !out || !g_lockReady) {
+        SetLastError(savedLastError);
+        return false;
+    }
+
+    bool found = false;
+    EnterCriticalSection(&g_lock);
+
+    for (DWORD i = 0; i < ARRAYSIZE(g_pending); i++) {
+        if (g_pending[i].inUse && g_pending[i].overlapped == overlapped) {
+            *out = g_pending[i];
+            g_pending[i].inUse = false;
+            found = true;
+            break;
+        }
+    }
+
+    LeaveCriticalSection(&g_lock);
+    SetLastError(savedLastError);
+    return found;
+}
+
+static bool TakePendingByEvent(HANDLE eventHandle, PendingTransfer* out) {
+    DWORD savedLastError = GetLastError();
+
+    if (!eventHandle || !out || !g_lockReady) {
+        SetLastError(savedLastError);
+        return false;
+    }
+
+    bool found = false;
+    EnterCriticalSection(&g_lock);
+
+    for (DWORD i = 0; i < ARRAYSIZE(g_pending); i++) {
+        if (g_pending[i].inUse && g_pending[i].eventHandle == eventHandle) {
+            *out = g_pending[i];
+            g_pending[i].inUse = false;
+            found = true;
+            break;
+        }
+    }
+
+    LeaveCriticalSection(&g_lock);
+    SetLastError(savedLastError);
+    return found;
+}
+
+static void EnqueuePendingTransfer(const PendingTransfer& transfer,
+                                   DWORD bytesTransferred,
+                                   BOOL ok,
+                                   DWORD lastError) {
+    if (bytesTransferred == 0) {
+        return;
+    }
+
+    EnqueueBuffer(transfer.api, transfer.apiW, transfer.direction,
+                  transfer.directionW, transfer.pipeId, transfer.buffer,
+                  transfer.requestedLength, bytesTransferred, ok, lastError,
+                  true);
+}
+
+static BOOL WINAPI WinUsb_WritePipe_Hook(WINUSB_INTERFACE_HANDLE interfaceHandle,
+                                         UCHAR pipeId,
+                                         PUCHAR buffer,
+                                         ULONG bufferLength,
+                                         PULONG lengthTransferred,
+                                         LPOVERLAPPED overlapped) {
+    BOOL ok = WinUsb_WritePipe_Original(interfaceHandle, pipeId, buffer,
+                                        bufferLength, lengthTransferred,
+                                        overlapped);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+    DWORD actualLength = lengthTransferred ? *lengthTransferred : bufferLength;
+
+    EnqueueBuffer("WinUsb_WritePipe", L"WritePipe", "out", L"out", pipeId,
+                  buffer, bufferLength, bufferLength, ok, lastError,
+                  !ok && lastError == ERROR_IO_PENDING);
+
+    if (ok && actualLength != bufferLength) {
+        EnqueueBuffer("WinUsb_WritePipe", L"WritePipe", "out_result",
+                      L"outres", pipeId, buffer, bufferLength, actualLength, ok,
+                      lastError, false);
+    }
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static BOOL WINAPI WinUsb_ReadPipe_Hook(WINUSB_INTERFACE_HANDLE interfaceHandle,
+                                        UCHAR pipeId,
+                                        PUCHAR buffer,
+                                        ULONG bufferLength,
+                                        PULONG lengthTransferred,
+                                        LPOVERLAPPED overlapped) {
+    BOOL ok = WinUsb_ReadPipe_Original(interfaceHandle, pipeId, buffer,
+                                       bufferLength, lengthTransferred,
+                                       overlapped);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+    DWORD actualLength = lengthTransferred ? *lengthTransferred : 0;
+
+    if (ok && actualLength > 0) {
+        EnqueueBuffer("WinUsb_ReadPipe", L"ReadPipe", "in", L"in", pipeId,
+                      buffer, bufferLength, actualLength, ok, lastError, false);
+    } else if (!ok && lastError == ERROR_IO_PENDING) {
+        RememberPending(overlapped, buffer, bufferLength, pipeId,
+                        "WinUsb_ReadPipe", L"ReadPipe", "in", L"in");
+    }
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static BOOL WINAPI WinUsb_ControlTransfer_Hook(
+    WINUSB_INTERFACE_HANDLE interfaceHandle,
+    WINUSB_SETUP_PACKET setupPacket,
+    PUCHAR buffer,
+    ULONG bufferLength,
+    PULONG lengthTransferred,
+    LPOVERLAPPED overlapped) {
+    bool isIn = (setupPacket.RequestType & 0x80) != 0;
+
+    if (!isIn && buffer && bufferLength > 0) {
+        EnqueueBuffer("WinUsb_ControlTransfer", L"Control", "ctrl_out",
+                      L"ctrlout", 0xff, buffer, bufferLength, bufferLength,
+                      TRUE, ERROR_SUCCESS, false);
+    }
+
+    BOOL ok = WinUsb_ControlTransfer_Original(interfaceHandle, setupPacket,
+                                              buffer, bufferLength,
+                                              lengthTransferred, overlapped);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+    DWORD actualLength = lengthTransferred ? *lengthTransferred : 0;
+
+    if (isIn && ok && actualLength > 0) {
+        EnqueueBuffer("WinUsb_ControlTransfer", L"Control", "ctrl_in",
+                      L"ctrlin", 0xff, buffer, bufferLength, actualLength, ok,
+                      lastError, false);
+    } else if (isIn && !ok && lastError == ERROR_IO_PENDING) {
+        RememberPending(overlapped, buffer, bufferLength, 0xff,
+                        "WinUsb_ControlTransfer", L"Control", "ctrl_in",
+                        L"ctrlin");
+    }
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static void EnqueueCompletedOverlapped(LPOVERLAPPED overlapped,
+                                       LPDWORD numberOfBytesTransferred,
+                                       BOOL ok,
+                                       DWORD lastError) {
+    if (!ok || !numberOfBytesTransferred || *numberOfBytesTransferred == 0) {
+        return;
+    }
+
+    PendingTransfer transfer = {};
+    if (TakePending(overlapped, &transfer)) {
+        EnqueuePendingTransfer(transfer, *numberOfBytesTransferred, ok,
+                               lastError);
+    }
+}
+
+static void EnqueueCompletedEvent(HANDLE eventHandle, BOOL ok, DWORD lastError) {
+    PendingTransfer transfer = {};
+    if (!TakePendingByEvent(eventHandle, &transfer)) {
+        return;
+    }
+
+    DWORD bytesTransferred = 0;
+    if (transfer.overlapped) {
+        bytesTransferred = static_cast<DWORD>(transfer.overlapped->InternalHigh);
+    }
+
+    EnqueuePendingTransfer(transfer, bytesTransferred, ok, lastError);
+}
+
+static BOOL WINAPI WinUsb_GetOverlappedResult_Hook(
+    WINUSB_INTERFACE_HANDLE interfaceHandle,
+    LPOVERLAPPED overlapped,
+    LPDWORD numberOfBytesTransferred,
+    BOOL wait) {
+    BOOL ok = WinUsb_GetOverlappedResult_Original(interfaceHandle, overlapped,
+                                                  numberOfBytesTransferred,
+                                                  wait);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+
+    EnqueueCompletedOverlapped(overlapped, numberOfBytesTransferred, ok,
+                               lastError);
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static BOOL WINAPI Kernel32_GetOverlappedResult_Hook(
+    HANDLE file,
+    LPOVERLAPPED overlapped,
+    LPDWORD numberOfBytesTransferred,
+    BOOL wait) {
+    BOOL ok = Kernel32_GetOverlappedResult_Original(
+        file, overlapped, numberOfBytesTransferred, wait);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+
+    EnqueueCompletedOverlapped(overlapped, numberOfBytesTransferred, ok,
+                               lastError);
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static BOOL WINAPI KernelBase_GetOverlappedResult_Hook(
+    HANDLE file,
+    LPOVERLAPPED overlapped,
+    LPDWORD numberOfBytesTransferred,
+    BOOL wait) {
+    BOOL ok = KernelBase_GetOverlappedResult_Original(
+        file, overlapped, numberOfBytesTransferred, wait);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+
+    EnqueueCompletedOverlapped(overlapped, numberOfBytesTransferred, ok,
+                               lastError);
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static BOOL WINAPI Kernel32_GetQueuedCompletionStatus_Hook(
+    HANDLE completionPort,
+    LPDWORD numberOfBytesTransferred,
+    PULONG_PTR completionKey,
+    LPOVERLAPPED* overlapped,
+    DWORD milliseconds) {
+    BOOL ok = Kernel32_GetQueuedCompletionStatus_Original(
+        completionPort, numberOfBytesTransferred, completionKey, overlapped,
+        milliseconds);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+
+    if (overlapped && *overlapped) {
+        EnqueueCompletedOverlapped(*overlapped, numberOfBytesTransferred, ok,
+                                   lastError);
+    }
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static BOOL WINAPI KernelBase_GetQueuedCompletionStatus_Hook(
+    HANDLE completionPort,
+    LPDWORD numberOfBytesTransferred,
+    PULONG_PTR completionKey,
+    LPOVERLAPPED* overlapped,
+    DWORD milliseconds) {
+    BOOL ok = KernelBase_GetQueuedCompletionStatus_Original(
+        completionPort, numberOfBytesTransferred, completionKey, overlapped,
+        milliseconds);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+
+    if (overlapped && *overlapped) {
+        EnqueueCompletedOverlapped(*overlapped, numberOfBytesTransferred, ok,
+                                   lastError);
+    }
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static BOOL WINAPI Kernel32_GetQueuedCompletionStatusEx_Hook(
+    HANDLE completionPort,
+    LPOVERLAPPED_ENTRY completionPortEntries,
+    ULONG count,
+    PULONG numEntriesRemoved,
+    DWORD milliseconds,
+    BOOL alertable) {
+    BOOL ok = Kernel32_GetQueuedCompletionStatusEx_Original(
+        completionPort, completionPortEntries, count, numEntriesRemoved,
+        milliseconds, alertable);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+
+    if (ok && completionPortEntries && numEntriesRemoved) {
+        for (ULONG i = 0; i < *numEntriesRemoved; i++) {
+            DWORD bytes = completionPortEntries[i].dwNumberOfBytesTransferred;
+            LPOVERLAPPED overlapped = completionPortEntries[i].lpOverlapped;
+            EnqueueCompletedOverlapped(overlapped, &bytes, ok, lastError);
+        }
+    }
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static BOOL WINAPI KernelBase_GetQueuedCompletionStatusEx_Hook(
+    HANDLE completionPort,
+    LPOVERLAPPED_ENTRY completionPortEntries,
+    ULONG count,
+    PULONG numEntriesRemoved,
+    DWORD milliseconds,
+    BOOL alertable) {
+    BOOL ok = KernelBase_GetQueuedCompletionStatusEx_Original(
+        completionPort, completionPortEntries, count, numEntriesRemoved,
+        milliseconds, alertable);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+
+    if (ok && completionPortEntries && numEntriesRemoved) {
+        for (ULONG i = 0; i < *numEntriesRemoved; i++) {
+            DWORD bytes = completionPortEntries[i].dwNumberOfBytesTransferred;
+            LPOVERLAPPED overlapped = completionPortEntries[i].lpOverlapped;
+            EnqueueCompletedOverlapped(overlapped, &bytes, ok, lastError);
+        }
+    }
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static DWORD WINAPI Kernel32_WaitForSingleObject_Hook(HANDLE handle,
+                                                       DWORD milliseconds) {
+    DWORD result = Kernel32_WaitForSingleObject_Original(handle, milliseconds);
+    DWORD lastError = GetLastError();
+
+    if (result == WAIT_OBJECT_0) {
+        EnqueueCompletedEvent(handle, TRUE, ERROR_SUCCESS);
+    }
+
+    SetLastError(lastError);
+    return result;
+}
+
+static DWORD WINAPI KernelBase_WaitForSingleObject_Hook(HANDLE handle,
+                                                         DWORD milliseconds) {
+    DWORD result = KernelBase_WaitForSingleObject_Original(handle, milliseconds);
+    DWORD lastError = GetLastError();
+
+    if (result == WAIT_OBJECT_0) {
+        EnqueueCompletedEvent(handle, TRUE, ERROR_SUCCESS);
+    }
+
+    SetLastError(lastError);
+    return result;
+}
+
+static DWORD WINAPI Kernel32_WaitForSingleObjectEx_Hook(HANDLE handle,
+                                                         DWORD milliseconds,
+                                                         BOOL alertable) {
+    DWORD result =
+        Kernel32_WaitForSingleObjectEx_Original(handle, milliseconds, alertable);
+    DWORD lastError = GetLastError();
+
+    if (result == WAIT_OBJECT_0) {
+        EnqueueCompletedEvent(handle, TRUE, ERROR_SUCCESS);
+    }
+
+    SetLastError(lastError);
+    return result;
+}
+
+static DWORD WINAPI KernelBase_WaitForSingleObjectEx_Hook(HANDLE handle,
+                                                           DWORD milliseconds,
+                                                           BOOL alertable) {
+    DWORD result = KernelBase_WaitForSingleObjectEx_Original(
+        handle, milliseconds, alertable);
+    DWORD lastError = GetLastError();
+
+    if (result == WAIT_OBJECT_0) {
+        EnqueueCompletedEvent(handle, TRUE, ERROR_SUCCESS);
+    }
+
+    SetLastError(lastError);
+    return result;
+}
+
+static void EnqueueCompletedWaitArrayResult(DWORD result,
+                                            DWORD count,
+                                            const HANDLE* handles,
+                                            BOOL waitAll) {
+    if (!handles || count == 0) {
+        return;
+    }
+
+    if (waitAll && result == WAIT_OBJECT_0) {
+        for (DWORD i = 0; i < count; i++) {
+            EnqueueCompletedEvent(handles[i], TRUE, ERROR_SUCCESS);
+        }
+    } else if (!waitAll && result >= WAIT_OBJECT_0 &&
+               result < WAIT_OBJECT_0 + count) {
+        EnqueueCompletedEvent(handles[result - WAIT_OBJECT_0], TRUE,
+                              ERROR_SUCCESS);
+    }
+}
+
+static DWORD WINAPI Kernel32_WaitForMultipleObjects_Hook(
+    DWORD count,
+    const HANDLE* handles,
+    BOOL waitAll,
+    DWORD milliseconds) {
+    DWORD result = Kernel32_WaitForMultipleObjects_Original(
+        count, handles, waitAll, milliseconds);
+    DWORD lastError = GetLastError();
+
+    EnqueueCompletedWaitArrayResult(result, count, handles, waitAll);
+
+    SetLastError(lastError);
+    return result;
+}
+
+static DWORD WINAPI KernelBase_WaitForMultipleObjects_Hook(
+    DWORD count,
+    const HANDLE* handles,
+    BOOL waitAll,
+    DWORD milliseconds) {
+    DWORD result = KernelBase_WaitForMultipleObjects_Original(
+        count, handles, waitAll, milliseconds);
+    DWORD lastError = GetLastError();
+
+    EnqueueCompletedWaitArrayResult(result, count, handles, waitAll);
+
+    SetLastError(lastError);
+    return result;
+}
+
+static DWORD WINAPI Kernel32_WaitForMultipleObjectsEx_Hook(
+    DWORD count,
+    const HANDLE* handles,
+    BOOL waitAll,
+    DWORD milliseconds,
+    BOOL alertable) {
+    DWORD result = Kernel32_WaitForMultipleObjectsEx_Original(
+        count, handles, waitAll, milliseconds, alertable);
+    DWORD lastError = GetLastError();
+
+    EnqueueCompletedWaitArrayResult(result, count, handles, waitAll);
+
+    SetLastError(lastError);
+    return result;
+}
+
+static DWORD WINAPI KernelBase_WaitForMultipleObjectsEx_Hook(
+    DWORD count,
+    const HANDLE* handles,
+    BOOL waitAll,
+    DWORD milliseconds,
+    BOOL alertable) {
+    DWORD result = KernelBase_WaitForMultipleObjectsEx_Original(
+        count, handles, waitAll, milliseconds, alertable);
+    DWORD lastError = GetLastError();
+
+    EnqueueCompletedWaitArrayResult(result, count, handles, waitAll);
+
+    SetLastError(lastError);
+    return result;
+}
+
+static bool HookExport(HMODULE module,
+                       const char* name,
+                       void* hook,
+                       void** original) {
+    void* target = reinterpret_cast<void*>(GetProcAddress(module, name));
+    if (!target) {
+        Wh_Log(L"missing export: %S", name);
+        return false;
+    }
+
+    if (!Wh_SetFunctionHook(target, hook, original)) {
+        Wh_Log(L"failed to hook export: %S", name);
+        return false;
+    }
+
+    Wh_Log(L"hooked export: %S", name);
+    return true;
+}
+
+static void FreeQueuedItems() {
+    CaptureItem* item = nullptr;
+    while ((item = PopCapture()) != nullptr) {
+        HeapFree(GetProcessHeap(), 0, item);
+    }
+}
+
+BOOL Wh_ModInit() {
+    InitializeCriticalSection(&g_lock);
+    g_lockReady = true;
+    g_queueEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!g_queueEvent) {
+        return FALSE;
+    }
+
+    InterlockedExchange(&g_workerStop, 0);
+    InterlockedExchange(&g_acceptingCaptures, 1);
+    g_workerThread = CreateThread(nullptr, 0, CaptureWorkerThread, nullptr, 0,
+                                  nullptr);
+    if (!g_workerThread) {
+        InterlockedExchange(&g_acceptingCaptures, 0);
+        CloseHandle(g_queueEvent);
+        g_queueEvent = nullptr;
+        DeleteCriticalSection(&g_lock);
+        g_lockReady = false;
+        return FALSE;
+    }
+
+    EnsureCaptureDirs();
+
+    HMODULE winusb = GetModuleHandleW(L"WINUSB.DLL");
+    if (!winusb) {
+        winusb = LoadLibraryW(L"WINUSB.DLL");
+    }
+    if (!winusb) {
+        Wh_Log(L"WINUSB.DLL is not available in this process");
+        return FALSE;
+    }
+
+    bool ok = true;
+    ok &= HookExport(winusb, "WinUsb_WritePipe",
+                     reinterpret_cast<void*>(WinUsb_WritePipe_Hook),
+                     reinterpret_cast<void**>(&WinUsb_WritePipe_Original));
+    ok &= HookExport(winusb, "WinUsb_ReadPipe",
+                     reinterpret_cast<void*>(WinUsb_ReadPipe_Hook),
+                     reinterpret_cast<void**>(&WinUsb_ReadPipe_Original));
+    ok &= HookExport(winusb, "WinUsb_ControlTransfer",
+                     reinterpret_cast<void*>(WinUsb_ControlTransfer_Hook),
+                     reinterpret_cast<void**>(&WinUsb_ControlTransfer_Original));
+    ok &= HookExport(
+        winusb, "WinUsb_GetOverlappedResult",
+        reinterpret_cast<void*>(WinUsb_GetOverlappedResult_Hook),
+        reinterpret_cast<void**>(&WinUsb_GetOverlappedResult_Original));
+
+    HMODULE kernel32 = GetModuleHandleW(L"KERNEL32.DLL");
+    if (kernel32) {
+        HookExport(kernel32, "GetOverlappedResult",
+                   reinterpret_cast<void*>(Kernel32_GetOverlappedResult_Hook),
+                   reinterpret_cast<void**>(
+                       &Kernel32_GetOverlappedResult_Original));
+        HookExport(kernel32, "GetQueuedCompletionStatus",
+                   reinterpret_cast<void*>(
+                       Kernel32_GetQueuedCompletionStatus_Hook),
+                   reinterpret_cast<void**>(
+                       &Kernel32_GetQueuedCompletionStatus_Original));
+        HookExport(kernel32, "GetQueuedCompletionStatusEx",
+                   reinterpret_cast<void*>(
+                       Kernel32_GetQueuedCompletionStatusEx_Hook),
+                   reinterpret_cast<void**>(
+                       &Kernel32_GetQueuedCompletionStatusEx_Original));
+        HookExport(kernel32, "WaitForSingleObject",
+                   reinterpret_cast<void*>(Kernel32_WaitForSingleObject_Hook),
+                   reinterpret_cast<void**>(
+                       &Kernel32_WaitForSingleObject_Original));
+        HookExport(kernel32, "WaitForSingleObjectEx",
+                   reinterpret_cast<void*>(Kernel32_WaitForSingleObjectEx_Hook),
+                   reinterpret_cast<void**>(
+                       &Kernel32_WaitForSingleObjectEx_Original));
+        HookExport(kernel32, "WaitForMultipleObjects",
+                   reinterpret_cast<void*>(Kernel32_WaitForMultipleObjects_Hook),
+                   reinterpret_cast<void**>(
+                       &Kernel32_WaitForMultipleObjects_Original));
+        HookExport(
+            kernel32, "WaitForMultipleObjectsEx",
+            reinterpret_cast<void*>(Kernel32_WaitForMultipleObjectsEx_Hook),
+            reinterpret_cast<void**>(&Kernel32_WaitForMultipleObjectsEx_Original));
+    }
+
+    HMODULE kernelBase = GetModuleHandleW(L"KERNELBASE.DLL");
+    if (kernelBase) {
+        HookExport(kernelBase, "GetOverlappedResult",
+                   reinterpret_cast<void*>(KernelBase_GetOverlappedResult_Hook),
+                   reinterpret_cast<void**>(
+                       &KernelBase_GetOverlappedResult_Original));
+        HookExport(kernelBase, "GetQueuedCompletionStatus",
+                   reinterpret_cast<void*>(
+                       KernelBase_GetQueuedCompletionStatus_Hook),
+                   reinterpret_cast<void**>(
+                       &KernelBase_GetQueuedCompletionStatus_Original));
+        HookExport(kernelBase, "GetQueuedCompletionStatusEx",
+                   reinterpret_cast<void*>(
+                       KernelBase_GetQueuedCompletionStatusEx_Hook),
+                   reinterpret_cast<void**>(
+                       &KernelBase_GetQueuedCompletionStatusEx_Original));
+        HookExport(kernelBase, "WaitForSingleObject",
+                   reinterpret_cast<void*>(KernelBase_WaitForSingleObject_Hook),
+                   reinterpret_cast<void**>(
+                       &KernelBase_WaitForSingleObject_Original));
+        HookExport(
+            kernelBase, "WaitForSingleObjectEx",
+            reinterpret_cast<void*>(KernelBase_WaitForSingleObjectEx_Hook),
+            reinterpret_cast<void**>(&KernelBase_WaitForSingleObjectEx_Original));
+        HookExport(
+            kernelBase, "WaitForMultipleObjects",
+            reinterpret_cast<void*>(KernelBase_WaitForMultipleObjects_Hook),
+            reinterpret_cast<void**>(&KernelBase_WaitForMultipleObjects_Original));
+        HookExport(kernelBase, "WaitForMultipleObjectsEx",
+                   reinterpret_cast<void*>(
+                       KernelBase_WaitForMultipleObjectsEx_Hook),
+                   reinterpret_cast<void**>(
+                       &KernelBase_WaitForMultipleObjectsEx_Original));
+    }
+
+    Wh_Log(L"Goodix WinUSB dump active at %s", kRoot);
+    return ok ? TRUE : FALSE;
+}
+
+void Wh_ModUninit() {
+    InterlockedExchange(&g_acceptingCaptures, 0);
+    InterlockedExchange(&g_workerStop, 1);
+
+    if (g_queueEvent) {
+        SetEvent(g_queueEvent);
+    }
+
+    if (g_workerThread) {
+        WaitForSingleObject(g_workerThread, 5000);
+        CloseHandle(g_workerThread);
+        g_workerThread = nullptr;
+    }
+
+    FreeQueuedItems();
+
+    if (g_queueEvent) {
+        CloseHandle(g_queueEvent);
+        g_queueEvent = nullptr;
+    }
+
+    if (g_lockReady) {
+        g_lockReady = false;
+        DeleteCriticalSection(&g_lock);
+    }
+}
