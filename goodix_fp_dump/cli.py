@@ -14,6 +14,7 @@ from .production import (
     read_production_data,
 )
 from .tls_probe import probe_device_tls
+from .windows_capture import analyze_capture, write_analysis_report
 
 
 def parse_int(value: str) -> int:
@@ -79,6 +80,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         choices=[variant.name for variant in PRODUCTION_READ_VARIANTS],
         help="variant to probe; may be supplied more than once",
+    )
+
+    windows_capture = subparsers.add_parser(
+        "analyze-windows-capture",
+        help="validate and summarize a Windows USBPcap capture",
+    )
+    windows_capture.add_argument("--pcap", type=Path, required=True)
+    windows_capture.add_argument("--vendor", type=parse_int, default=0x27C6)
+    windows_capture.add_argument("--product", type=parse_int, default=0x521D)
+    windows_capture.add_argument(
+        "--output-dir",
+        type=Path,
+        help="directory for windows-capture-analysis.json/.md",
     )
 
     return parser
@@ -197,6 +211,33 @@ def main(argv: list[str] | None = None) -> int:
             )
         )
         return 0 if manifest["status"] == "ok" else 2
+
+    if args.command == "analyze-windows-capture":
+        analysis = analyze_capture(
+            args.pcap,
+            vendor=args.vendor,
+            product=args.product,
+        )
+        if args.output_dir:
+            write_analysis_report(
+                analysis,
+                json_path=args.output_dir / "windows-capture-analysis.json",
+                markdown_path=args.output_dir / "windows-capture-analysis.md",
+            )
+        print(
+            json.dumps(
+                {
+                    "target_present": analysis["target_present"],
+                    "valid_for_protocol_analysis": analysis[
+                        "valid_for_protocol_analysis"
+                    ],
+                    "target_addresses": analysis["target_addresses"],
+                    "conclusion": analysis["conclusion"],
+                },
+                sort_keys=True,
+            )
+        )
+        return 0 if analysis["valid_for_protocol_analysis"] else 2
 
     raise AssertionError(f"unhandled command {args.command}")
 
