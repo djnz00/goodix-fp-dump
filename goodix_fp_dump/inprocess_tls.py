@@ -9,6 +9,13 @@ class InProcessTLSError(RuntimeError):
     pass
 
 
+def has_psk_support() -> bool:
+    return bool(getattr(ssl, "HAS_PSK", False)) and hasattr(
+        ssl.SSLContext,
+        "set_psk_server_callback",
+    )
+
+
 @dataclass(slots=True)
 class PSKMemoryTLSServer:
     psk: bytes
@@ -21,7 +28,7 @@ class PSKMemoryTLSServer:
     complete: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
-        if not ssl.HAS_PSK:
+        if not has_psk_support():
             raise InProcessTLSError("Python ssl was built without PSK support")
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2

@@ -80,7 +80,7 @@ class ArchiveRun:
         path_ = Path(path)
         stat = path_.stat()
         return {
-            "path": str(path_.relative_to(self.path)),
+            "path": path_.relative_to(self.path).as_posix(),
             "sha256": sha256_file(path_),
             "size": stat.st_size,
             "mtime_ns": stat.st_mtime_ns,

@@ -90,6 +90,8 @@ def analyze_capture(
     decoded = decode_goodix_payloads(data_rows, target_addresses)
     unattributed_decoded = decode_goodix_payloads(data_rows, None)
 
+    has_target_goodix_messages = bool(decoded["command_counts"])
+
     return {
         "schema": "goodix-windows-capture-analysis-v1",
         "pcap": str(pcap_),
@@ -99,9 +101,7 @@ def analyze_capture(
         },
         "target_present": bool(target_addresses),
         "target_addresses": sorted(target_addresses),
-        "valid_for_protocol_analysis": bool(
-            target_addresses and data_summary["target_data_frames"] > 0
-        ),
+        "valid_for_protocol_analysis": bool(target_addresses and has_target_goodix_messages),
         "descriptors": descriptors,
         "data_summary": data_summary,
         "goodix_messages": decoded,
@@ -109,6 +109,7 @@ def analyze_capture(
         "conclusion": _conclusion(
             target_addresses,
             data_summary,
+            decoded,
             unattributed_decoded,
             vendor,
             product,
@@ -460,6 +461,7 @@ def _run_tshark(
 def _conclusion(
     target_addresses: set[str],
     data_summary: dict[str, Any],
+    target_messages: dict[str, Any],
     unattributed_messages: dict[str, Any],
     vendor: int,
     product: int,
@@ -483,6 +485,13 @@ def _conclusion(
         return (
             f"The target `{target}` enumerated, but no target payload-bearing USB "
             "rows were captured. Re-capture while starting Windows Hello flows."
+        )
+    if not target_messages["command_counts"]:
+        return (
+            f"The target `{target}` enumerated, but no Goodix message-pack or TLS "
+            "data frames were decoded for that device address. The capture is "
+            "descriptor/control-only for protocol purposes and cannot be used to "
+            "infer `0xe4`, `0xd0`, TLS, or `0x20` behavior."
         )
     return (
         f"The capture contains target `{target}` traffic and can be inspected for "

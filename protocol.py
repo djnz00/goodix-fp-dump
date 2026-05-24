@@ -2,9 +2,9 @@ import abc
 import struct
 import time
 
-import periphery
-import spidev
 import usb
+
+from goodix_fp_dump.usb_backend import get_libusb_backend
 
 
 class Protocol(abc.ABC):
@@ -35,7 +35,11 @@ class USBProtocol(Protocol):
             timeout += time.time()
 
         while True:
-            device = usb.core.find(idVendor=vendor, idProduct=product)
+            device = usb.core.find(
+                idVendor=vendor,
+                idProduct=product,
+                backend=get_libusb_backend(),
+            )
 
             if device is not None:
                 try:
@@ -102,11 +106,27 @@ class USBProtocol(Protocol):
         self.endpoint_out: int = endpoint_out.bEndpointAddress
         print(f"Found endpoint out: {hex(self.endpoint_out)}")
 
-        if self.device.is_kernel_driver_active(self.interface_number):
+        try:
+            kernel_driver_active = self.device.is_kernel_driver_active(
+                self.interface_number
+            )
+        except (NotImplementedError, usb.core.USBError):
+            kernel_driver_active = False
+
+        if kernel_driver_active:
             self.device.detach_kernel_driver(self.interface_number)
             self.detached_kernel_driver = True
 
         self.device.set_configuration()
+        usb.util.claim_interface(self.device, self.interface_number)
+        self._clear_endpoint_halts()
+
+    def _clear_endpoint_halts(self):
+        for endpoint in (self.endpoint_in, self.endpoint_out):
+            try:
+                self.device.clear_halt(endpoint)
+            except (NotImplementedError, usb.core.USBError):
+                pass
 
     def write(self, data, timeout=5):
         timeout = 0 if timeout is None else round(timeout * 1000)
@@ -145,6 +165,9 @@ class SPIProtocol(Protocol):
 
     def __init__(self, vendor, product, timeout=5):
         super().__init__(vendor, product, timeout)
+
+        import periphery
+        import spidev
 
         self.device: spidev.SpiDev = spidev.SpiDev(0, 0)
         self.interrupt: periphery.CdevGPIO = periphery.CdevGPIO(

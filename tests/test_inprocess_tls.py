@@ -4,12 +4,15 @@ import ssl
 
 import pytest
 
-from goodix_fp_dump.inprocess_tls import PSKMemoryTLSServer
+from goodix_fp_dump.inprocess_tls import PSKMemoryTLSServer, has_psk_support
 
 pytestmark = pytest.mark.unit
 
 
 def test_psk_memory_tls_server_handshakes_with_python_client() -> None:
+    if not has_psk_support():
+        pytest.skip("Python ssl was built without PSK support")
+
     psk = bytes.fromhex("00" * 32)
     server = PSKMemoryTLSServer(psk)
     client_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)

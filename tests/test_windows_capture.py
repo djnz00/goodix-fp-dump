@@ -107,6 +107,35 @@ def test_goodix_message_decode_counts_target_commands(monkeypatch, tmp_path) -> 
     ]
 
 
+def test_descriptor_only_target_capture_is_not_protocol_valid(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    def fake_run_tshark(pcap, *, fields, display_filter, tshark):
+        if fields == windows_capture.DESCRIPTOR_FIELDS:
+            return TSharkResult(
+                fields=fields,
+                stdout="2\t0.0\t1\t0x27c6\t0x521d\t0x01\n",
+            )
+        return TSharkResult(
+            fields=fields,
+            stdout=(
+                "2\t0.0\t1\thost\t1.1.0\t0x80\t18\t0x02\t\t\t"
+                "1201000200000040c6271d52000001020301\n"
+            ),
+        )
+
+    monkeypatch.setattr(windows_capture, "_run_tshark", fake_run_tshark)
+
+    analysis = windows_capture.analyze_capture(tmp_path / "capture.pcap")
+
+    assert analysis["target_present"] is True
+    assert analysis["data_summary"]["target_data_frames"] == 1
+    assert analysis["valid_for_protocol_analysis"] is False
+    assert analysis["goodix_messages"]["command_counts"] == []
+    assert "descriptor/control-only" in analysis["conclusion"]
+
+
 def test_analyze_capture_reports_unattributed_goodix_candidates(
     monkeypatch,
     tmp_path,

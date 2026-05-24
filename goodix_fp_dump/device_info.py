@@ -2,12 +2,37 @@ from __future__ import annotations
 
 import importlib.metadata as metadata
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 import usb.core
+
+from .usb_backend import backend_info, get_libusb_backend
+
+
+WINDOWS_TOOL_CANDIDATES = {
+    "git": [r"C:\Program Files\Git\cmd\git.exe"],
+    "openssl": [
+        r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
+        r"C:\Program Files\Git\usr\bin\openssl.exe",
+    ],
+    "tshark": [r"C:\Program Files\Wireshark\tshark.exe"],
+    "USBPcapCMD": [r"C:\Program Files\USBPcap\USBPcapCMD.exe"],
+}
+
+
+def resolve_tool(name: str) -> str:
+    found = shutil.which(name)
+    if found and Path(found).suffix.lower() == ".exe":
+        return found
+    if sys.platform == "win32":
+        for candidate in WINDOWS_TOOL_CANDIDATES.get(name, []):
+            if Path(candidate).exists():
+                return candidate
+    return found or name
 
 
 def run_command(args: list[str], timeout: float = 5) -> dict[str, Any]:
@@ -53,9 +78,10 @@ def package_versions(names: list[str]) -> dict[str, str | None]:
 
 def repo_commit(path: Path | str) -> dict[str, Any]:
     path_ = Path(path)
-    head = run_command(["git", "-C", str(path_), "rev-parse", "HEAD"])
-    branch = run_command(["git", "-C", str(path_), "branch", "--show-current"])
-    dirty = run_command(["git", "-C", str(path_), "status", "--short"])
+    git = resolve_tool("git")
+    head = run_command([git, "-C", str(path_), "rev-parse", "HEAD"])
+    branch = run_command([git, "-C", str(path_), "branch", "--show-current"])
+    dirty = run_command([git, "-C", str(path_), "status", "--short"])
     return {
         "path": str(path_),
         "head": head.get("stdout") if head.get("returncode") == 0 else None,
@@ -70,7 +96,11 @@ def usb_device_info(vendor: int, product: int) -> dict[str, Any]:
         "product_id": f"{product:04x}",
         "found": False,
     }
-    device = usb.core.find(idVendor=vendor, idProduct=product)
+    device = usb.core.find(
+        idVendor=vendor,
+        idProduct=product,
+        backend=get_libusb_backend(),
+    )
     if device is None:
         return info
 
@@ -113,6 +143,7 @@ def collect_preflight(
             "packages": package_versions(
                 [
                     "pyusb",
+                    "libusb-package",
                     "crcmod",
                     "python-periphery",
                     "spidev",
@@ -122,10 +153,14 @@ def collect_preflight(
             ),
         },
         "tools": {
-            "lsusb": run_command(["lsusb", "-d", f"{vendor:04x}:{product:04x}"]),
-            "openssl": run_command(["openssl", "version"]),
-            "tshark": run_command(["tshark", "--version"], timeout=10),
+            "lsusb": run_command(
+                [resolve_tool("lsusb"), "-d", f"{vendor:04x}:{product:04x}"]
+            ),
+            "openssl": run_command([resolve_tool("openssl"), "version"]),
+            "tshark": run_command([resolve_tool("tshark"), "--version"], timeout=10),
+            "USBPcapCMD": run_command([resolve_tool("USBPcapCMD"), "--help"]),
         },
+        "pyusb_backend": backend_info(),
         "usb": usb_device_info(vendor, product),
         "repos": repos,
     }
