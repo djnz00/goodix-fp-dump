@@ -2,7 +2,7 @@
 // @id              goodix-winusb-dump
 // @name            Goodix WinUSB dump
 // @description     Dump WinUSB buffers from the Goodix UMDF driver host.
-// @version         0.4
+// @version         0.5
 // @author          local
 // @include         WUDFHost.exe
 // @architecture    x86-64
@@ -56,6 +56,9 @@ typedef struct _WH_IO_STATUS_BLOCK {
 typedef WH_NTSTATUS(NTAPI* NtDeviceIoControlFile_t)(
     HANDLE, HANDLE, PVOID, PVOID, WH_IO_STATUS_BLOCK*, ULONG, PVOID, ULONG,
     PVOID, ULONG);
+typedef LONG_PTR(WINAPI* WbdiPresetPskPskGet_t)(void*, void*, DWORD, DWORD*,
+                                                void*, DWORD);
+typedef LONG_PTR(WINAPI* WbdiIoHubExec_t)(void*, void*);
 
 static WinUsb_ReadPipe_t WinUsb_ReadPipe_Original;
 static WinUsb_WritePipe_t WinUsb_WritePipe_Original;
@@ -70,6 +73,8 @@ static GetQueuedCompletionStatusEx_t KernelBase_GetQueuedCompletionStatusEx_Orig
 static DeviceIoControl_t Kernel32_DeviceIoControl_Original;
 static DeviceIoControl_t KernelBase_DeviceIoControl_Original;
 static NtDeviceIoControlFile_t Ntdll_NtDeviceIoControlFile_Original;
+static WbdiPresetPskPskGet_t WbdiPresetPskPskGet_Original;
+static WbdiIoHubExec_t WbdiIoHubExec_Original;
 static WaitForSingleObject_t Kernel32_WaitForSingleObject_Original;
 static WaitForSingleObject_t KernelBase_WaitForSingleObject_Original;
 static WaitForSingleObjectEx_t Kernel32_WaitForSingleObjectEx_Original;
@@ -228,6 +233,83 @@ static void WriteAll(HANDLE file, const void* data, DWORD bytes) {
         p += written;
         remaining -= written;
     }
+}
+
+static bool IsReadableProtection(DWORD protect) {
+    if (protect & PAGE_GUARD) {
+        return false;
+    }
+
+    protect &= 0xff;
+    return protect == PAGE_READONLY || protect == PAGE_READWRITE ||
+           protect == PAGE_WRITECOPY || protect == PAGE_EXECUTE_READ ||
+           protect == PAGE_EXECUTE_READWRITE ||
+           protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+static bool IsReadableRange(const void* buffer, SIZE_T length) {
+    if (!buffer || length == 0 || length > kMaxCaptureBytes) {
+        return false;
+    }
+
+    ULONG_PTR start = reinterpret_cast<ULONG_PTR>(buffer);
+    ULONG_PTR end = start + length;
+    if (end < start) {
+        return false;
+    }
+
+    ULONG_PTR cursor = start;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (!VirtualQuery(reinterpret_cast<void*>(cursor), &mbi, sizeof(mbi))) {
+            return false;
+        }
+
+        if (mbi.State != MEM_COMMIT || !IsReadableProtection(mbi.Protect)) {
+            return false;
+        }
+
+        ULONG_PTR regionEnd =
+            reinterpret_cast<ULONG_PTR>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= cursor) {
+            return false;
+        }
+
+        cursor = regionEnd < end ? regionEnd : end;
+    }
+
+    return true;
+}
+
+static bool ReadMemoryValue(const void* base,
+                            SIZE_T offset,
+                            void* out,
+                            SIZE_T outLength) {
+    const BYTE* address = static_cast<const BYTE*>(base) + offset;
+    if (!out || !IsReadableRange(address, outLength)) {
+        return false;
+    }
+
+    CopyMemory(out, address, outLength);
+    return true;
+}
+
+static DWORD ReadU32Field(const void* base, SIZE_T offset) {
+    DWORD value = 0;
+    ReadMemoryValue(base, offset, &value, sizeof(value));
+    return value;
+}
+
+static WORD ReadU16Field(const void* base, SIZE_T offset) {
+    WORD value = 0;
+    ReadMemoryValue(base, offset, &value, sizeof(value));
+    return value;
+}
+
+static void* ReadPointerField(const void* base, SIZE_T offset) {
+    void* value = nullptr;
+    ReadMemoryValue(base, offset, &value, sizeof(value));
+    return value;
 }
 
 static bool WriteBinaryFile(const wchar_t* path, const BYTE* buffer, DWORD length) {
@@ -408,7 +490,7 @@ static void EnqueueBufferWithIoctl(const char* api,
     DWORD savedLastError = GetLastError();
 
     if (!buffer || actualLength == 0 || actualLength > kMaxCaptureBytes ||
-        !g_lockReady || !g_queueEvent ||
+        !IsReadableRange(buffer, actualLength) || !g_lockReady || !g_queueEvent ||
         !InterlockedCompareExchange(&g_acceptingCaptures, 0, 0)) {
         SetLastError(savedLastError);
         return;
@@ -1199,6 +1281,100 @@ static WH_NTSTATUS NTAPI Ntdll_NtDeviceIoControlFile_Hook(
     return status;
 }
 
+static DWORD ClampReadableLength(const void* buffer,
+                                 DWORD requestedLength,
+                                 DWORD fallbackLength) {
+    DWORD length = requestedLength ? requestedLength : fallbackLength;
+    if (length > kMaxCaptureBytes) {
+        length = kMaxCaptureBytes;
+    }
+
+    if (!length || !IsReadableRange(buffer, length)) {
+        return 0;
+    }
+
+    return length;
+}
+
+static void CaptureWbdiCommandBuffer(const char* direction,
+                                     const wchar_t* directionW,
+                                     DWORD tag,
+                                     const void* buffer,
+                                     DWORD requestedLength,
+                                     DWORD fallbackLength,
+                                     BOOL ok,
+                                     DWORD lastError) {
+    DWORD length = ClampReadableLength(buffer, requestedLength, fallbackLength);
+    if (!length) {
+        return;
+    }
+
+    EnqueueBufferWithIoctl("WbdiIoHubExec", L"WbdiIoHub", direction,
+                           directionW, 0xfb, tag,
+                           static_cast<const BYTE*>(buffer), requestedLength,
+                           length, ok, lastError, false);
+}
+
+static LONG_PTR WINAPI WbdiPresetPskPskGet_Hook(void* context,
+                                                void* outputBuffer,
+                                                DWORD outputBufferLength,
+                                                DWORD* outputLength,
+                                                void* source,
+                                                DWORD sourceLength) {
+    LONG_PTR result = WbdiPresetPskPskGet_Original(
+        context, outputBuffer, outputBufferLength, outputLength, source,
+        sourceLength);
+
+    DWORD actualLength = 0;
+    if (outputLength && IsReadableRange(outputLength, sizeof(*outputLength))) {
+        CopyMemory(&actualLength, outputLength, sizeof(actualLength));
+    }
+
+    if (result == 0 && actualLength > 0 &&
+        actualLength <= outputBufferLength) {
+        EnqueueBufferWithIoctl("WbdiPskGet", L"WbdiPskGet", "wbdi_psk",
+                               L"wbdipsk", 0xfa, 0x50534b00,
+                               static_cast<const BYTE*>(outputBuffer),
+                               outputBufferLength, actualLength, TRUE,
+                               ERROR_SUCCESS, false);
+    }
+
+    return result;
+}
+
+static LONG_PTR WINAPI WbdiIoHubExec_Hook(void* ioHub, void* command) {
+    DWORD workType = ReadU32Field(command, 0x04);
+    DWORD commandId = ReadU16Field(command, 0x08);
+    DWORD tag = (workType << 16) | commandId;
+    void* outBuffer = ReadPointerField(command, 0x10);
+    DWORD outLength = ReadU32Field(command, 0x18);
+    void* inBuffer = ReadPointerField(command, 0x20);
+    DWORD inLength = ReadU32Field(command, 0x28);
+
+    if (outBuffer && outLength) {
+        CaptureWbdiCommandBuffer(workType == 5 ? "wbdi_tls_out"
+                                               : "wbdi_cmd_out",
+                                 workType == 5 ? L"wbditlsout"
+                                               : L"wbdicmdout",
+                                 tag, outBuffer, outLength, outLength, TRUE,
+                                 ERROR_SUCCESS);
+    }
+
+    LONG_PTR result = WbdiIoHubExec_Original(ioHub, command);
+
+    DWORD status = ReadU32Field(command, 0x60);
+    if (inBuffer && inLength) {
+        CaptureWbdiCommandBuffer(workType == 5 ? "wbdi_tls_in"
+                                               : "wbdi_cmd_in",
+                                 workType == 5 ? L"wbditlsin"
+                                               : L"wbdicmdin",
+                                 tag, inBuffer, inLength, inLength,
+                                 result != 0 ? TRUE : FALSE, status);
+    }
+
+    return result;
+}
+
 static bool HookExport(HMODULE module,
                        const char* name,
                        void* hook,
@@ -1215,6 +1391,27 @@ static bool HookExport(HMODULE module,
     }
 
     Wh_Log(L"hooked export: %S", name);
+    return true;
+}
+
+static bool HookInternal(HMODULE module,
+                         DWORD_PTR rva,
+                         const wchar_t* name,
+                         void* hook,
+                         void** original) {
+    if (!module) {
+        Wh_Log(L"missing module for internal hook: %s", name);
+        return false;
+    }
+
+    void* target = reinterpret_cast<void*>(
+        reinterpret_cast<BYTE*>(module) + rva);
+    if (!Wh_SetFunctionHook(target, hook, original)) {
+        Wh_Log(L"failed to hook internal: %s at RVA 0x%Ix", name, rva);
+        return false;
+    }
+
+    Wh_Log(L"hooked internal: %s at RVA 0x%Ix", name, rva);
     return true;
 }
 
@@ -1353,6 +1550,23 @@ BOOL Wh_ModInit() {
         HookExport(ntdll, "NtDeviceIoControlFile",
                    reinterpret_cast<void*>(Ntdll_NtDeviceIoControlFile_Hook),
                    reinterpret_cast<void**>(&Ntdll_NtDeviceIoControlFile_Original));
+    }
+
+    HMODULE wbdi = GetModuleHandleW(L"Wbdi.dll");
+    if (!wbdi) {
+        wbdi = GetModuleHandleW(L"WBDI.DLL");
+    }
+    if (wbdi) {
+        ok &= HookInternal(wbdi, 0x78658, L"Wbdi!PresetPskPskGet",
+                           reinterpret_cast<void*>(
+                               WbdiPresetPskPskGet_Hook),
+                           reinterpret_cast<void**>(
+                               &WbdiPresetPskPskGet_Original));
+        ok &= HookInternal(wbdi, 0x5c550, L"Wbdi!IoHubExec",
+                           reinterpret_cast<void*>(WbdiIoHubExec_Hook),
+                           reinterpret_cast<void**>(&WbdiIoHubExec_Original));
+    } else {
+        Wh_Log(L"Wbdi.dll is not loaded; internal WBDI hooks skipped");
     }
 
     Wh_Log(L"Goodix WinUSB dump active at %s", kRoot);
