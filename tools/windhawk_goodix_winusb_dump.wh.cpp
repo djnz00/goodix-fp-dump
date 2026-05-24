@@ -2,7 +2,7 @@
 // @id              goodix-winusb-dump
 // @name            Goodix WinUSB dump
 // @description     Dump WinUSB buffers from the Goodix UMDF driver host.
-// @version         0.2
+// @version         0.4
 // @author          local
 // @include         WUDFHost.exe
 // @architecture    x86-64
@@ -35,12 +35,27 @@ typedef BOOL(WINAPI* GetQueuedCompletionStatus_t)(HANDLE, LPDWORD, PULONG_PTR,
                                                   LPOVERLAPPED*, DWORD);
 typedef BOOL(WINAPI* GetQueuedCompletionStatusEx_t)(HANDLE, LPOVERLAPPED_ENTRY,
                                                     ULONG, PULONG, DWORD, BOOL);
+typedef BOOL(WINAPI* DeviceIoControl_t)(HANDLE, DWORD, LPVOID, DWORD, LPVOID,
+                                        DWORD, LPDWORD, LPOVERLAPPED);
 typedef DWORD(WINAPI* WaitForSingleObject_t)(HANDLE, DWORD);
 typedef DWORD(WINAPI* WaitForSingleObjectEx_t)(HANDLE, DWORD, BOOL);
 typedef DWORD(WINAPI* WaitForMultipleObjects_t)(DWORD, const HANDLE*, BOOL,
                                                 DWORD);
 typedef DWORD(WINAPI* WaitForMultipleObjectsEx_t)(DWORD, const HANDLE*, BOOL,
                                                   DWORD, BOOL);
+typedef LONG WH_NTSTATUS;
+
+typedef struct _WH_IO_STATUS_BLOCK {
+    union {
+        WH_NTSTATUS Status;
+        PVOID Pointer;
+    };
+    ULONG_PTR Information;
+} WH_IO_STATUS_BLOCK;
+
+typedef WH_NTSTATUS(NTAPI* NtDeviceIoControlFile_t)(
+    HANDLE, HANDLE, PVOID, PVOID, WH_IO_STATUS_BLOCK*, ULONG, PVOID, ULONG,
+    PVOID, ULONG);
 
 static WinUsb_ReadPipe_t WinUsb_ReadPipe_Original;
 static WinUsb_WritePipe_t WinUsb_WritePipe_Original;
@@ -52,6 +67,9 @@ static GetQueuedCompletionStatus_t Kernel32_GetQueuedCompletionStatus_Original;
 static GetQueuedCompletionStatus_t KernelBase_GetQueuedCompletionStatus_Original;
 static GetQueuedCompletionStatusEx_t Kernel32_GetQueuedCompletionStatusEx_Original;
 static GetQueuedCompletionStatusEx_t KernelBase_GetQueuedCompletionStatusEx_Original;
+static DeviceIoControl_t Kernel32_DeviceIoControl_Original;
+static DeviceIoControl_t KernelBase_DeviceIoControl_Original;
+static NtDeviceIoControlFile_t Ntdll_NtDeviceIoControlFile_Original;
 static WaitForSingleObject_t Kernel32_WaitForSingleObject_Original;
 static WaitForSingleObject_t KernelBase_WaitForSingleObject_Original;
 static WaitForSingleObjectEx_t Kernel32_WaitForSingleObjectEx_Original;
@@ -62,6 +80,7 @@ static WaitForMultipleObjectsEx_t Kernel32_WaitForMultipleObjectsEx_Original;
 static WaitForMultipleObjectsEx_t KernelBase_WaitForMultipleObjectsEx_Original;
 
 static const DWORD kMaxCaptureBytes = 1024 * 1024;
+static const WH_NTSTATUS kStatusPending = 0x00000103;
 static const wchar_t* kRoot = L"C:\\goodix-capture\\windhawk-winusb";
 static const wchar_t* kBuffers = L"C:\\goodix-capture\\windhawk-winusb\\buffers";
 static const wchar_t* kEvents = L"C:\\goodix-capture\\windhawk-winusb\\events.jsonl";
@@ -71,6 +90,7 @@ struct PendingTransfer {
     HANDLE eventHandle;
     PUCHAR buffer;
     ULONG requestedLength;
+    DWORD ioctlCode;
     UCHAR pipeId;
     bool inUse;
     char api[32];
@@ -90,6 +110,7 @@ struct CaptureItem {
     wchar_t apiW[32];
     wchar_t directionW[16];
     UCHAR pipeId;
+    DWORD ioctlCode;
     DWORD requestedLength;
     DWORD actualLength;
     BOOL ok;
@@ -284,11 +305,11 @@ static void AppendEventJson(const CaptureItem* item,
         line,
         "{\"seq\":%ld,\"utc\":\"%s\",\"pid\":%lu,\"tid\":%lu,"
         "\"api\":\"%s\",\"direction\":\"%s\",\"pipe\":%u,"
-        "\"requested_len\":%lu,\"actual_len\":%lu,\"ok\":%s,"
+        "\"ioctl\":\"0x%08lx\",\"requested_len\":%lu,\"actual_len\":%lu,\"ok\":%s,"
         "\"last_error\":%lu,\"pending\":%s,\"buffer_bin\":\"%s\","
         "\"buffer_hex\":\"%s\"}\r\n",
         item->seq, item->utc, item->pid, item->tid, item->api,
-        item->direction, item->pipeId, item->requestedLength,
+        item->direction, item->pipeId, item->ioctlCode, item->requestedLength,
         item->actualLength, item->ok ? "true" : "false", item->lastError,
         item->pending ? "true" : "false", binJson, hexJson);
 
@@ -372,17 +393,18 @@ static DWORD WINAPI CaptureWorkerThread(void*) {
     return 0;
 }
 
-static void EnqueueBuffer(const char* api,
-                          const wchar_t* apiW,
-                          const char* direction,
-                          const wchar_t* directionW,
-                          UCHAR pipeId,
-                          const BYTE* buffer,
-                          DWORD requestedLength,
-                          DWORD actualLength,
-                          BOOL ok,
-                          DWORD lastError,
-                          bool pending) {
+static void EnqueueBufferWithIoctl(const char* api,
+                                   const wchar_t* apiW,
+                                   const char* direction,
+                                   const wchar_t* directionW,
+                                   UCHAR pipeId,
+                                   DWORD ioctlCode,
+                                   const BYTE* buffer,
+                                   DWORD requestedLength,
+                                   DWORD actualLength,
+                                   BOOL ok,
+                                   DWORD lastError,
+                                   bool pending) {
     DWORD savedLastError = GetLastError();
 
     if (!buffer || actualLength == 0 || actualLength > kMaxCaptureBytes ||
@@ -404,6 +426,7 @@ static void EnqueueBuffer(const char* api,
     item->pid = GetCurrentProcessId();
     item->tid = GetCurrentThreadId();
     item->pipeId = pipeId;
+    item->ioctlCode = ioctlCode;
     item->requestedLength = requestedLength;
     item->actualLength = actualLength;
     item->ok = ok;
@@ -429,14 +452,32 @@ static void EnqueueBuffer(const char* api,
     SetLastError(savedLastError);
 }
 
-static void RememberPending(LPOVERLAPPED overlapped,
-                            PUCHAR buffer,
-                            ULONG requestedLength,
-                            UCHAR pipeId,
-                            const char* api,
-                            const wchar_t* apiW,
-                            const char* direction,
-                            const wchar_t* directionW) {
+static void EnqueueBuffer(const char* api,
+                          const wchar_t* apiW,
+                          const char* direction,
+                          const wchar_t* directionW,
+                          UCHAR pipeId,
+                          const BYTE* buffer,
+                          DWORD requestedLength,
+                          DWORD actualLength,
+                          BOOL ok,
+                          DWORD lastError,
+                          bool pending) {
+    EnqueueBufferWithIoctl(api, apiW, direction, directionW, pipeId, 0, buffer,
+                           requestedLength, actualLength, ok, lastError,
+                           pending);
+}
+
+static void RememberPendingEx(LPOVERLAPPED overlapped,
+                              HANDLE eventHandle,
+                              PUCHAR buffer,
+                              ULONG requestedLength,
+                              UCHAR pipeId,
+                              DWORD ioctlCode,
+                              const char* api,
+                              const wchar_t* apiW,
+                              const char* direction,
+                              const wchar_t* directionW) {
     DWORD savedLastError = GetLastError();
 
     if (!overlapped || !buffer || !g_lockReady) {
@@ -455,9 +496,11 @@ static void RememberPending(LPOVERLAPPED overlapped,
 
     if (slot < ARRAYSIZE(g_pending)) {
         g_pending[slot].overlapped = overlapped;
-        g_pending[slot].eventHandle = overlapped->hEvent;
+        g_pending[slot].eventHandle =
+            eventHandle ? eventHandle : (overlapped ? overlapped->hEvent : nullptr);
         g_pending[slot].buffer = buffer;
         g_pending[slot].requestedLength = requestedLength;
+        g_pending[slot].ioctlCode = ioctlCode;
         g_pending[slot].pipeId = pipeId;
         g_pending[slot].inUse = true;
         CopyAnsi(g_pending[slot].api, ARRAYSIZE(g_pending[slot].api), api);
@@ -470,6 +513,18 @@ static void RememberPending(LPOVERLAPPED overlapped,
 
     LeaveCriticalSection(&g_lock);
     SetLastError(savedLastError);
+}
+
+static void RememberPending(LPOVERLAPPED overlapped,
+                            PUCHAR buffer,
+                            ULONG requestedLength,
+                            UCHAR pipeId,
+                            const char* api,
+                            const wchar_t* apiW,
+                            const char* direction,
+                            const wchar_t* directionW) {
+    RememberPendingEx(overlapped, nullptr, buffer, requestedLength, pipeId, 0,
+                      api, apiW, direction, directionW);
 }
 
 static bool TakePending(LPOVERLAPPED overlapped, PendingTransfer* out) {
@@ -522,6 +577,14 @@ static bool TakePendingByEvent(HANDLE eventHandle, PendingTransfer* out) {
     return found;
 }
 
+static DWORD ClampTransferLength(ULONG_PTR reportedLength, DWORD bufferLength) {
+    if (reportedLength > bufferLength) {
+        return bufferLength;
+    }
+
+    return static_cast<DWORD>(reportedLength);
+}
+
 static void EnqueuePendingTransfer(const PendingTransfer& transfer,
                                    DWORD bytesTransferred,
                                    BOOL ok,
@@ -530,10 +593,71 @@ static void EnqueuePendingTransfer(const PendingTransfer& transfer,
         return;
     }
 
-    EnqueueBuffer(transfer.api, transfer.apiW, transfer.direction,
-                  transfer.directionW, transfer.pipeId, transfer.buffer,
-                  transfer.requestedLength, bytesTransferred, ok, lastError,
-                  true);
+    EnqueueBufferWithIoctl(transfer.api, transfer.apiW, transfer.direction,
+                           transfer.directionW, transfer.pipeId,
+                           transfer.ioctlCode, transfer.buffer,
+                           transfer.requestedLength, bytesTransferred, ok,
+                           lastError, true);
+}
+
+static void ScanCompletedPendingTransfers() {
+    DWORD savedLastError = GetLastError();
+
+    struct CompletedTransfer {
+        PendingTransfer transfer;
+        DWORD bytesTransferred;
+        BOOL ok;
+        DWORD lastError;
+    };
+
+    CompletedTransfer completed[64] = {};
+    DWORD completedCount = 0;
+
+    if (!g_lockReady) {
+        SetLastError(savedLastError);
+        return;
+    }
+
+    EnterCriticalSection(&g_lock);
+
+    for (DWORD i = 0; i < ARRAYSIZE(g_pending) &&
+                      completedCount < ARRAYSIZE(completed);
+         i++) {
+        if (!g_pending[i].inUse || !g_pending[i].overlapped) {
+            continue;
+        }
+
+        ULONG_PTR status = g_pending[i].overlapped->Internal;
+        ULONG_PTR bytes = g_pending[i].overlapped->InternalHigh;
+
+        if (status == kStatusPending) {
+            continue;
+        }
+
+        completed[completedCount].transfer = g_pending[i];
+        completed[completedCount].bytesTransferred =
+            ClampTransferLength(bytes, g_pending[i].requestedLength);
+        completed[completedCount].ok =
+            (static_cast<LONG>(status) >= 0) ? TRUE : FALSE;
+        completed[completedCount].lastError =
+            completed[completedCount].ok ? ERROR_SUCCESS
+                                         : static_cast<DWORD>(status);
+        completedCount++;
+        g_pending[i].inUse = false;
+    }
+
+    LeaveCriticalSection(&g_lock);
+
+    for (DWORD i = 0; i < completedCount; i++) {
+        if (completed[i].bytesTransferred > 0) {
+            EnqueuePendingTransfer(completed[i].transfer,
+                                   completed[i].bytesTransferred,
+                                   completed[i].ok,
+                                   completed[i].lastError);
+        }
+    }
+
+    SetLastError(savedLastError);
 }
 
 static BOOL WINAPI WinUsb_WritePipe_Hook(WINUSB_INTERFACE_HANDLE interfaceHandle,
@@ -924,6 +1048,157 @@ static DWORD WINAPI KernelBase_WaitForMultipleObjectsEx_Hook(
     return result;
 }
 
+static void EnqueueIoctlInput(const char* api,
+                              const wchar_t* apiW,
+                              DWORD ioctlCode,
+                              const void* inputBuffer,
+                              DWORD inputBufferLength) {
+    ScanCompletedPendingTransfers();
+
+    if (!inputBuffer || inputBufferLength == 0) {
+        return;
+    }
+
+    EnqueueBufferWithIoctl(api, apiW, "ioctl_in", L"ioctlin", 0xfe,
+                           ioctlCode, static_cast<const BYTE*>(inputBuffer),
+                           inputBufferLength, inputBufferLength, TRUE,
+                           ERROR_SUCCESS, false);
+}
+
+static void EnqueueIoctlOutput(const char* api,
+                               const wchar_t* apiW,
+                               DWORD ioctlCode,
+                               const void* outputBuffer,
+                               DWORD outputBufferLength,
+                               DWORD actualLength,
+                               BOOL ok,
+                               DWORD lastError,
+                               bool pending) {
+    if (!outputBuffer || actualLength == 0) {
+        return;
+    }
+
+    DWORD clampedLength = ClampTransferLength(actualLength, outputBufferLength);
+    EnqueueBufferWithIoctl(api, apiW, "ioctl_out", L"ioctlout", 0xfd,
+                           ioctlCode, static_cast<const BYTE*>(outputBuffer),
+                           outputBufferLength, clampedLength, ok, lastError,
+                           pending);
+}
+
+static void RememberIoctlOutput(LPOVERLAPPED overlapped,
+                                HANDLE eventHandle,
+                                DWORD ioctlCode,
+                                void* outputBuffer,
+                                DWORD outputBufferLength,
+                                const char* api,
+                                const wchar_t* apiW) {
+    if (!outputBuffer || outputBufferLength == 0) {
+        return;
+    }
+
+    RememberPendingEx(overlapped, eventHandle, static_cast<PUCHAR>(outputBuffer),
+                      outputBufferLength, 0xfd, ioctlCode, api, apiW,
+                      "ioctl_out", L"ioctlout");
+}
+
+static BOOL WINAPI Kernel32_DeviceIoControl_Hook(HANDLE device,
+                                                 DWORD ioctlCode,
+                                                 LPVOID inputBuffer,
+                                                 DWORD inputBufferLength,
+                                                 LPVOID outputBuffer,
+                                                 DWORD outputBufferLength,
+                                                 LPDWORD bytesReturned,
+                                                 LPOVERLAPPED overlapped) {
+    EnqueueIoctlInput("DeviceIoControl", L"DevIoctl", ioctlCode, inputBuffer,
+                      inputBufferLength);
+
+    BOOL ok = Kernel32_DeviceIoControl_Original(
+        device, ioctlCode, inputBuffer, inputBufferLength, outputBuffer,
+        outputBufferLength, bytesReturned, overlapped);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+    DWORD actualLength = bytesReturned ? *bytesReturned : 0;
+
+    if (ok && actualLength > 0) {
+        EnqueueIoctlOutput("DeviceIoControl", L"DevIoctl", ioctlCode,
+                           outputBuffer, outputBufferLength, actualLength, ok,
+                           lastError, false);
+    } else if (!ok && lastError == ERROR_IO_PENDING && overlapped) {
+        RememberIoctlOutput(overlapped, overlapped->hEvent, ioctlCode,
+                            outputBuffer, outputBufferLength,
+                            "DeviceIoControl", L"DevIoctl");
+    }
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static BOOL WINAPI KernelBase_DeviceIoControl_Hook(HANDLE device,
+                                                   DWORD ioctlCode,
+                                                   LPVOID inputBuffer,
+                                                   DWORD inputBufferLength,
+                                                   LPVOID outputBuffer,
+                                                   DWORD outputBufferLength,
+                                                   LPDWORD bytesReturned,
+                                                   LPOVERLAPPED overlapped) {
+    EnqueueIoctlInput("DeviceIoControl", L"DevIoctl", ioctlCode, inputBuffer,
+                      inputBufferLength);
+
+    BOOL ok = KernelBase_DeviceIoControl_Original(
+        device, ioctlCode, inputBuffer, inputBufferLength, outputBuffer,
+        outputBufferLength, bytesReturned, overlapped);
+    DWORD lastError = ok ? ERROR_SUCCESS : GetLastError();
+    DWORD actualLength = bytesReturned ? *bytesReturned : 0;
+
+    if (ok && actualLength > 0) {
+        EnqueueIoctlOutput("DeviceIoControl", L"DevIoctl", ioctlCode,
+                           outputBuffer, outputBufferLength, actualLength, ok,
+                           lastError, false);
+    } else if (!ok && lastError == ERROR_IO_PENDING && overlapped) {
+        RememberIoctlOutput(overlapped, overlapped->hEvent, ioctlCode,
+                            outputBuffer, outputBufferLength,
+                            "DeviceIoControl", L"DevIoctl");
+    }
+
+    SetLastError(lastError);
+    return ok;
+}
+
+static WH_NTSTATUS NTAPI Ntdll_NtDeviceIoControlFile_Hook(
+    HANDLE file,
+    HANDLE eventHandle,
+    PVOID apcRoutine,
+    PVOID apcContext,
+    WH_IO_STATUS_BLOCK* ioStatusBlock,
+    ULONG ioctlCode,
+    PVOID inputBuffer,
+    ULONG inputBufferLength,
+    PVOID outputBuffer,
+    ULONG outputBufferLength) {
+    EnqueueIoctlInput("NtDeviceIoControlFile", L"NtDevIoctl", ioctlCode,
+                      inputBuffer, inputBufferLength);
+
+    WH_NTSTATUS status = Ntdll_NtDeviceIoControlFile_Original(
+        file, eventHandle, apcRoutine, apcContext, ioStatusBlock, ioctlCode,
+        inputBuffer, inputBufferLength, outputBuffer, outputBufferLength);
+    DWORD lastError = GetLastError();
+
+    if (status >= 0 && status != kStatusPending && ioStatusBlock) {
+        DWORD actualLength =
+            ClampTransferLength(ioStatusBlock->Information, outputBufferLength);
+        EnqueueIoctlOutput("NtDeviceIoControlFile", L"NtDevIoctl", ioctlCode,
+                           outputBuffer, outputBufferLength, actualLength, TRUE,
+                           ERROR_SUCCESS, false);
+    } else if (status == kStatusPending && ioStatusBlock) {
+        RememberIoctlOutput(reinterpret_cast<LPOVERLAPPED>(ioStatusBlock),
+                            eventHandle, ioctlCode, outputBuffer,
+                            outputBufferLength, "NtDeviceIoControlFile",
+                            L"NtDevIoctl");
+    }
+
+    SetLastError(lastError);
+    return status;
+}
+
 static bool HookExport(HMODULE module,
                        const char* name,
                        void* hook,
@@ -999,6 +1274,9 @@ BOOL Wh_ModInit() {
 
     HMODULE kernel32 = GetModuleHandleW(L"KERNEL32.DLL");
     if (kernel32) {
+        HookExport(kernel32, "DeviceIoControl",
+                   reinterpret_cast<void*>(Kernel32_DeviceIoControl_Hook),
+                   reinterpret_cast<void**>(&Kernel32_DeviceIoControl_Original));
         HookExport(kernel32, "GetOverlappedResult",
                    reinterpret_cast<void*>(Kernel32_GetOverlappedResult_Hook),
                    reinterpret_cast<void**>(
@@ -1033,6 +1311,10 @@ BOOL Wh_ModInit() {
 
     HMODULE kernelBase = GetModuleHandleW(L"KERNELBASE.DLL");
     if (kernelBase) {
+        HookExport(kernelBase, "DeviceIoControl",
+                   reinterpret_cast<void*>(KernelBase_DeviceIoControl_Hook),
+                   reinterpret_cast<void**>(
+                       &KernelBase_DeviceIoControl_Original));
         HookExport(kernelBase, "GetOverlappedResult",
                    reinterpret_cast<void*>(KernelBase_GetOverlappedResult_Hook),
                    reinterpret_cast<void**>(
@@ -1064,6 +1346,13 @@ BOOL Wh_ModInit() {
                        KernelBase_WaitForMultipleObjectsEx_Hook),
                    reinterpret_cast<void**>(
                        &KernelBase_WaitForMultipleObjectsEx_Original));
+    }
+
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll) {
+        HookExport(ntdll, "NtDeviceIoControlFile",
+                   reinterpret_cast<void*>(Ntdll_NtDeviceIoControlFile_Hook),
+                   reinterpret_cast<void**>(&Ntdll_NtDeviceIoControlFile_Original));
     }
 
     Wh_Log(L"Goodix WinUSB dump active at %s", kRoot);
