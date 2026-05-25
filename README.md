@@ -65,6 +65,10 @@ unless you have a verified restore path for that exact device.
 - `firmware/` is a submodule with firmware data and metadata.
 - `wireshark/` contains Goodix protocol dissectors.
 - `log/` contains Windows logging helpers, not raw local logs.
+- `tools/windhawk_goodix_winusb_dump.wh.cpp` and
+  `tools/windhawk-goodix-capture.md` document the Windhawk/WBDI capture path
+  used to inspect the Windows driver and capture the stock 52xd/10034 TLS PSK
+  into a private archive.
 
 ## Tests and lint
 
