@@ -1,6 +1,0 @@
-pyusb
-crcmod
-python-periphery
-spidev
-pycryptodome
-crccheck

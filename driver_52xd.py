@@ -1,45 +1,26 @@
-import hashlib
-import hmac
 import argparse
+import hashlib
 import json
 import random
 import re
 import socket
-import struct
-import subprocess
 import time
 
 import goodix
 import protocol
 import tool
+from goodix_fp_dump import preview
 from goodix_fp_dump.firmware import (
     OTPReadResult,
-    build_flash_plan,
     classify_otp,
     classify_otp_error,
 )
-from goodix_fp_dump.safety import SafetyPlan
 from goodix_fp_dump.tls_proxy import TLSServer
 
-TARGET_FIRMWARE = "GFUSB_GM168SEC_APP_10019"
-IAP_FIRMWARE = "MILAN_GM168SEC_IAP_10007"
 VALID_FIRMWARE = "GFUSB_GM168SEC_APP_100[0-9]{2}"
 
-PSK = bytes.fromhex(
-    "0000000000000000000000000000000000000000000000000000000000000000")
-
-PSK_WHITE_BOX = bytes.fromhex(
-    "ec35ae3abb45ed3f12c4751f1e5c2cc05b3c5452e9104d9f2a3118644f37a04b"
-    "6fd66b1d97cf80f1345f76c84f03ff30bb51bf308f2a9875c41e6592cd2a2f9e"
-    "60809b17b5316037b69bb2fa5d4c8ac31edb3394046ec06bbdacc57da6a756c5")
-
-PMK_HASH = bytes.fromhex(
-    "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925")
-
-PMK_HASH_10034 = bytes.fromhex(
-    "8b20e9bf659c6e34e27881612010b1b467c378f3e13334c57fb63fae960e7c89")
-
-VALID_PMK_HASHES = (PMK_HASH, PMK_HASH_10034)
+PMK_HASH_LENGTH = 32
+PSK_FILE_LEN = 32
 
 DEVICE_CONFIG = bytes.fromhex(
     "701160712c9d2cc91ce518fd00fd00fd03ba000180ca0008008400bec38600b1"
@@ -57,109 +38,42 @@ DEVICE_POV_CONFIG = bytes.fromhex(
 
 SENSOR_WIDTH = 80
 SENSOR_HEIGHT = 64
+IMAGE_FRAME_BYTES = 7684
 
-ACTIVE_SAFETY_PLAN: SafetyPlan | None = None
-
-
-def set_safety_plan(plan: SafetyPlan | None):
-    global ACTIVE_SAFETY_PLAN
-    ACTIVE_SAFETY_PLAN = plan
-
-
-def require_destructive_operation(operation: str):
-    if ACTIVE_SAFETY_PLAN is None:
-        raise RuntimeError(f"{operation} requires a safety plan")
-    SafetyPlan(
-        target=ACTIVE_SAFETY_PLAN.target,
-        allow_write=ACTIVE_SAFETY_PLAN.allow_write,
-        confirmation=ACTIVE_SAFETY_PLAN.confirmation,
-        stock_dump_sha256=ACTIVE_SAFETY_PLAN.stock_dump_sha256,
-        firmware_family=ACTIVE_SAFETY_PLAN.firmware_family,
-        psk_evidence=ACTIVE_SAFETY_PLAN.psk_evidence,
-        operations=(operation,),
-    ).validate()
-
-
-def init_device(product: int):
-    device = goodix.Device(product, protocol.USBProtocol)
+def init_device(product: int, *, strict_read_only: bool = False):
+    transport = (lambda vendor, product, timeout:
+                 protocol.USBProtocol(vendor, product, timeout,
+                                      strict_read_only=strict_read_only))
+    device = goodix.Device(product, transport)
 
     device.nop()
 
     return device
 
 
-def check_psk(device: goodix.Device):
-    reply = device.preset_psk_read(0xbb020001, len(PMK_HASH), 0)
-    if not reply[0]:
-        raise ValueError("Failed to read PSK")
+def classify_device_psk_state(reply):
+    """Whether the 0xbb020001 reply is a well-formed 32-byte device hash.
 
-    if reply[1] != 0xbb020001:
-        raise ValueError("Invalid flags")
-
-    return reply[2] in VALID_PMK_HASHES
-
-
-def write_psk(device: goodix.Device):
-    require_destructive_operation("write_psk")
-
-    if not device.preset_psk_write(0xbb010003, PSK_WHITE_BOX, 114, 0,
-                                   bytes.fromhex("56a5bb956b7c8d9e0000")):
-        return False
-
-    if not check_psk(device):
-        return False
-
-    return True
-
-
-def erase_firmware(device: goodix.Device):
-    require_destructive_operation("erase_firmware")
-    device.mcu_erase_app(50, True)
-
-
-def update_firmware(device: goodix.Device):
-    require_destructive_operation("update_firmware")
-
-    firmware_file = open(f"firmware/52xd/{TARGET_FIRMWARE}.bin", "rb")
-    firmware = firmware_file.read()
-    firmware_file.close()
-
-    mod = b""
-    for i in range(1, 65):
-        mod += struct.pack("<B", i)
-    raw_pmk = (struct.pack(">H", len(PSK)) + PSK) * 2
-    pmk = hashlib.sha256(raw_pmk).digest()
-    pmk_hmac = hmac.new(pmk, mod, hashlib.sha256).digest()
-    firmware_hmac = hmac.new(pmk_hmac, firmware, hashlib.sha256).digest()
-
-    try:
-        length = len(firmware)
-        for i in range(0, length, 256):
-            if not device.write_firmware(i, firmware[i:i + 256], 2):
-                raise ValueError("Failed to write firmware")
-
-        if not device.check_firmware(None, None, None, firmware_hmac):
-            raise ValueError("Failed to check firmware")
-
-    except Exception as error:
-        print(
-            tool.warning(
-                f"The program went into serious problems while trying to "
-                f"update the firmware: {error}"))
-
-        erase_firmware(device)
-
-        raise error
-
-    device.reset(False, True, 50)
-    device.disconnect()
+    There is no "recognized" outcome for this family. The siblings can
+    recognise a hash because they share one factory PSK; the 521d is
+    provisioned with a random per-device key, so the only hash this code
+    could ever match is one specific unit's, which is not something a
+    published probe should report on.
+    """
+    if not isinstance(reply, (tuple, list)) or len(reply) < 3:
+        return "invalid/unreadable"
+    if not reply[0] or reply[1] != 0xbb020001:
+        return "invalid/unreadable"
+    if not isinstance(reply[2], bytes) or len(reply[2]) != PMK_HASH_LENGTH:
+        return "invalid/unreadable"
+    return "unknown_device_hash"
 
 
 def read_otp_diagnostics(device: goodix.Device, retries: int = 1, delay: float = 0.1):
     errors = []
     for attempt in range(retries + 1):
         try:
-            result = classify_otp(device.read_otp())
+            result = classify_otp(goodix.Device.read_otp(device))
         except Exception as error:
             result = classify_otp_error(error)
             errors.append(result.as_dict())
@@ -179,25 +93,28 @@ def read_otp_diagnostics(device: goodix.Device, retries: int = 1, delay: float =
 
 
 def read_only_probe(product: int):
-    device = init_device(product)
+    device = init_device(product, strict_read_only=True)
     try:
         firmware = None
-        valid_psk = None
+        device_psk_reply = None
+        device_psk_state = "invalid/unreadable"
         try:
             firmware = device.firmware_version()
         except Exception as error:
             firmware = {"error": str(error)}
 
         try:
-            valid_psk = check_psk(device)
+            device_psk_reply = device.preset_psk_read(0xbb020001,
+                                                       PMK_HASH_LENGTH, 0)
+            device_psk_state = classify_device_psk_state(device_psk_reply)
         except Exception as error:
-            valid_psk = {"error": str(error)}
+            device_psk_state = "invalid/unreadable"
 
         return {
             "product": f"{product:04x}",
             "path": "run_521d.py -> driver_52xd.py -> protocol.USBProtocol",
             "firmware": firmware,
-            "valid_psk": valid_psk,
+            "device_psk_state": device_psk_state,
             "otp": read_otp_diagnostics(device, retries=1).as_dict(),
         }
     finally:
@@ -207,301 +124,263 @@ def read_only_probe(product: int):
             pass
 
 
-def run_driver(device: goodix.Device):
-    tls_server = TLSServer(PSK.hex()).start()
+def _verify_and_get_psk(device: goodix.Device, psk_file: str) -> bytes:
+    """Live self-check: sha256(PSK from --psk-file) must equal the device's
+    0xbb020001 readback. No hardcoded unit hash; works on any 521d."""
+    firmware = device.firmware_version()
+    assert re.fullmatch(VALID_FIRMWARE, firmware)
 
-    try:
-        if not device.reset(True, False, 20)[0]:
-            raise ValueError("Reset failed")
+    reply = device.preset_psk_read(0xbb020001, PMK_HASH_LENGTH, 0)
+    assert reply[0] and reply[1] == 0xbb020001
+    device_hash = reply[2]
 
-        device.read_sensor_register(0x0000,
-                                    4)  # Read chip ID (0x00a5 or 0x00a6)
-
-        otp = device.read_otp()
-
-        if len(otp) < 64:
-            raise ValueError("Invalid OTP")
-
-        # OTP 1: 4e4c4d31372e0000b9828da2a2d73e09
-        #        08196896800000ee6014a774a060b614
-        #        ea2704009b0056f007212723a1a7a300
-        #        00000000000000000000000083760000
-        # OTP 2: 4e4b35594c2e00002983759520190009
-        #        08274c96800000f0103cae6ea010593c
-        #        ea2f04009c0053f00729312ba8b0aa00
-        #        000000000000000000000000f3830000
-
-        tls_client = socket.socket()
-        tls_client.connect(("localhost", 4433))
-
-        try:
-            tool.connect_device(device, tls_client)
-
-            if not device.upload_config_mcu(DEVICE_CONFIG):
-                raise ValueError("Failed to upload config")
-
-            device.set_drv_state()
-
-            device.mcu_get_pov_image()
-
-            device.mcu_switch_to_fdt_mode(
-                b"\x0d\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00", False)
-            device.mcu_switch_to_fdt_mode(
-                b"\x0d\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x01", True)
-
-            device.write_sensor_register(0x022c, b"\x0a\x03")
-
-            tls_client.sendall(
-                device.mcu_get_image(
-                    b"\x01\x03\x27\x01\x21\x01\x27\x01\x23\x01",
-                    goodix.FLAGS_TRANSPORT_LAYER_SECURITY_DATA)[9:])
-
-            tool.write_pgm(
-                tool.decode_image(tls_server.stdout.read(7684)[:-4]),
-                SENSOR_WIDTH, SENSOR_HEIGHT, "clear-0.pgm")
-
-            device.write_sensor_register(0x022c, b"\x0a\x02")
-
-            device.write_sensor_register(0x022c, b"\x0a\x03")
-
-            tls_client.sendall(
-                device.mcu_get_image(
-                    b"\x81\x03\x27\x01\x21\x01\x27\x01\x23\x01",
-                    goodix.FLAGS_TRANSPORT_LAYER_SECURITY_DATA)[9:])
-
-            tool.write_pgm(
-                tool.decode_image(tls_server.stdout.read(7684)[:-4]),
-                SENSOR_WIDTH, SENSOR_HEIGHT, "clear-1.pgm")
-
-            device.write_sensor_register(0x022c, b"\x0a\x02")
-
-            device.write_sensor_register(0x022c, b"\x0a\x03")
-
-            tls_client.sendall(
-                device.mcu_get_image(
-                    b"\x81\x03\x18\x01\x12\x01\x18\x01\x14\x01",
-                    goodix.FLAGS_TRANSPORT_LAYER_SECURITY_DATA)[9:])
-
-            tool.write_pgm(
-                tool.decode_image(tls_server.stdout.read(7684)[:-4]),
-                SENSOR_WIDTH, SENSOR_HEIGHT, "clear-2.pgm")
-
-            device.write_sensor_register(0x022c, b"\x0a\x02")
-
-            device.mcu_switch_to_fdt_mode(
-                b"\x8d\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00", False)
-            device.mcu_switch_to_fdt_mode(
-                b"\x8d\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x01", True)
-
-            device.write_sensor_register(0x022c, b"\x0a\x03")
-
-            tls_client.sendall(
-                device.mcu_get_image(
-                    b"\x81\x03\x27\x01\x21\x01\x27\x01\x23\x01",
-                    goodix.FLAGS_TRANSPORT_LAYER_SECURITY_DATA)[9:])
-
-            tool.write_pgm(
-                tool.decode_image(tls_server.stdout.read(7684)[:-4]),
-                SENSOR_WIDTH, SENSOR_HEIGHT, "clear-3.pgm")
-
-            device.write_sensor_register(0x022c, b"\x0a\x02")
-
-            device.mcu_switch_to_fdt_mode(
-                b"\x0d\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00", False)
-            device.mcu_switch_to_fdt_mode(
-                b"\x0d\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x00\x00\x00\x00\x00\x00"
-                b"\x00\x00\x01", True)
-
-            device.set_pov_config(DEVICE_POV_CONFIG)
-
-            device.mcu_switch_to_sleep_mode()
-
-            device.query_mcu_state(b"\x01\x01\x01", False)
-
-            device.mcu_switch_to_fdt_down(
-                b"\x9c\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
-                b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
-                b"\x8c\x8c\x00\x00\x05\x03\xa7\x00"
-                b"\xa1\x00\xa7\x00\xa3\x00\x00", False)
-
-            device.mcu_switch_to_fdt_down(
-                b"\x9c\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
-                b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
-                b"\x8c\x8c\x01\x00\x05\x03\xa7\x00"
-                b"\xa1\x00\xa7\x00\xa3\x00\x00", False)
-
-            device.mcu_switch_to_sleep_mode()
-
-            device.query_mcu_state(b"\x00\x00\x00", False)
-
-            device.query_mcu_state(b"\x01\x01\x01", False)
-
-            device.mcu_switch_to_fdt_down(
-                b"\x9c\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
-                b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
-                b"\x8c\x8c\x00\x00\x05\x03\xa7\x00"
-                b"\xa1\x00\xa7\x00\xa3\x00\x00", False)
-
-            print("Waiting for finger...")
-
-            device.mcu_switch_to_fdt_down(
-                b"\x9c\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
-                b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
-                b"\x8c\x8c\x01\x00\x05\x03\xa7\x00"
-                b"\xa1\x00\xa7\x00\xa3\x00\x00", True)
-
-            device.mcu_switch_to_fdt_mode(
-                b"\x0d\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
-                b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
-                b"\x8c\x8c\x00", False)
-
-            device.mcu_switch_to_fdt_mode(
-                b"\x0d\x01\x27\x01\x21\x01\x27\x01"
-                b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
-                b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
-                b"\x8c\x8c\x01", True)
-
-            device.write_sensor_register(0x022c, b"\x05\x03")
-
-            tls_client.sendall(
-                device.mcu_get_image(
-                    b"\x45\x03\xa7\x00\xa1\x00\xa7\x00\xa3\x00",
-                    goodix.FLAGS_TRANSPORT_LAYER_SECURITY_DATA)[9:])
-
-            tool.write_pgm(
-                tool.decode_image(tls_server.stdout.read(7684)[:-4]),
-                SENSOR_WIDTH, SENSOR_HEIGHT, "fingerprint.pgm")
-
-        finally:
-            tls_client.close()
-    finally:
-        tls_server.stop()
+    assert psk_file
+    with open(psk_file, 'rb') as fh:
+        psk = fh.read()
+    assert len(psk) == PSK_FILE_LEN
+    assert hashlib.sha256(psk).digest() == device_hash
+    return psk
 
 
-def main(product: int):
-    print(
-        tool.warning(
-            "This program might break your device.\n"
-            "Consider that it may flash the device firmware.\n"
-            "Continue at your own risk.\n"
-            "But don't hold us responsible if your device is broken!\n"
-            "Don't run this program as part of a regular process."))
+def _bring_up(device: goodix.Device, tls_client: socket.socket, tls_server: TLSServer):
+    if not device.upload_config_mcu(DEVICE_CONFIG):
+        raise ValueError("Failed to upload config")
 
-    code = random.randint(0, 9999)
+    device.set_drv_state()
+    device.mcu_get_pov_image()
 
-    if input(f"Type {code} to continue and confirm that you are not a bot: "
-             ) != str(code):
-        print("Abort")
-        return
+    device.mcu_switch_to_fdt_mode(
+        b"\x0d\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00", False)
+    device.mcu_switch_to_fdt_mode(
+        b"\x0d\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x01", True)
 
-    previous_firmware = None
+    # Calibration/"clear" frames: reverse-engineered as required sensor
+    # bring-up; omitting them left the sensor saturated on the first real
+    # attempt.
+    device.write_sensor_register(0x022c, b"\x0a\x03")
+    tls_client.sendall(
+        device.mcu_get_image(
+            b"\x01\x03\x27\x01\x21\x01\x27\x01\x23\x01",
+            goodix.FLAGS_TRANSPORT_LAYER_SECURITY_DATA)[9:])
+    tls_server.stdout.read(IMAGE_FRAME_BYTES)
 
+    device.write_sensor_register(0x022c, b"\x0a\x02")
+    device.write_sensor_register(0x022c, b"\x0a\x03")
+    tls_client.sendall(
+        device.mcu_get_image(
+            b"\x81\x03\x27\x01\x21\x01\x27\x01\x23\x01",
+            goodix.FLAGS_TRANSPORT_LAYER_SECURITY_DATA)[9:])
+    tls_server.stdout.read(IMAGE_FRAME_BYTES)
+
+    device.write_sensor_register(0x022c, b"\x0a\x02")
+    device.write_sensor_register(0x022c, b"\x0a\x03")
+    tls_client.sendall(
+        device.mcu_get_image(
+            b"\x81\x03\x18\x01\x12\x01\x18\x01\x14\x01",
+            goodix.FLAGS_TRANSPORT_LAYER_SECURITY_DATA)[9:])
+    tls_server.stdout.read(IMAGE_FRAME_BYTES)
+
+    device.write_sensor_register(0x022c, b"\x0a\x02")
+
+    device.mcu_switch_to_fdt_mode(
+        b"\x8d\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00", False)
+    device.mcu_switch_to_fdt_mode(
+        b"\x8d\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x01", True)
+
+    device.write_sensor_register(0x022c, b"\x0a\x03")
+    tls_client.sendall(
+        device.mcu_get_image(
+            b"\x81\x03\x27\x01\x21\x01\x27\x01\x23\x01",
+            goodix.FLAGS_TRANSPORT_LAYER_SECURITY_DATA)[9:])
+    tls_server.stdout.read(IMAGE_FRAME_BYTES)
+
+    device.write_sensor_register(0x022c, b"\x0a\x02")
+
+    device.mcu_switch_to_fdt_mode(
+        b"\x0d\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00", False)
+    device.mcu_switch_to_fdt_mode(
+        b"\x0d\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x00\x00\x00\x00\x00\x00"
+        b"\x00\x00\x01", True)
+
+    device.set_pov_config(DEVICE_POV_CONFIG)
+
+    device.mcu_switch_to_sleep_mode()
+    device.query_mcu_state(b"\x01\x01\x01", False)
+
+
+def _arm_and_capture_one(
+        device: goodix.Device, tls_client: socket.socket, tls_server: TLSServer):
+    device.mcu_switch_to_fdt_down(
+        b"\x9c\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
+        b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
+        b"\x8c\x8c\x00\x00\x05\x03\xa7\x00"
+        b"\xa1\x00\xa7\x00\xa3\x00\x00", False)
+    device.mcu_switch_to_fdt_down(
+        b"\x9c\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
+        b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
+        b"\x8c\x8c\x01\x00\x05\x03\xa7\x00"
+        b"\xa1\x00\xa7\x00\xa3\x00\x00", False)
+
+    device.mcu_switch_to_sleep_mode()
+    device.query_mcu_state(b"\x00\x00\x00", False)
+    device.query_mcu_state(b"\x01\x01\x01", False)
+
+    device.mcu_switch_to_fdt_down(
+        b"\x9c\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
+        b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
+        b"\x8c\x8c\x00\x00\x05\x03\xa7\x00"
+        b"\xa1\x00\xa7\x00\xa3\x00\x00", False)
+
+    print("Waiting for finger...")
+    device.mcu_switch_to_fdt_down(
+        b"\x9c\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
+        b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
+        b"\x8c\x8c\x01\x00\x05\x03\xa7\x00"
+        b"\xa1\x00\xa7\x00\xa3\x00\x00", True)
+
+    device.mcu_switch_to_fdt_mode(
+        b"\x0d\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
+        b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
+        b"\x8c\x8c\x00", False)
+    device.mcu_switch_to_fdt_mode(
+        b"\x0d\x01\x27\x01\x21\x01\x27\x01"
+        b"\x23\x01\x8d\x8d\x86\x86\x97\x97"
+        b"\x8f\x8f\x9b\x9b\x92\x92\x96\x96"
+        b"\x8c\x8c\x01", True)
+
+    device.write_sensor_register(0x022c, b"\x05\x03")
+
+    tls_client.sendall(
+        device.mcu_get_image(
+            b"\x45\x03\xa7\x00\xa1\x00\xa7\x00\xa3\x00",
+            goodix.FLAGS_TRANSPORT_LAYER_SECURITY_DATA)[9:])
+
+    raw = tls_server.stdout.read(IMAGE_FRAME_BYTES)[:-4]
+    return tool.decode_image(raw)
+
+
+def single_shot_capture(product: int, psk_file: str):
+    """Read-only-PSK real capture: bring up the chip, wait for a finger, grab
+    exactly one frame, and feed it to the live preview."""
     device = init_device(product)
+    try:
+        device.nop()
+        psk = _verify_and_get_psk(device, psk_file)
 
-    while True:
-        firmware = device.firmware_version()
-        print(f"Firmware: {firmware}")
+        tls_server = TLSServer(psk=psk.hex()).start()
+        try:
+            tls_client = socket.socket()
+            tls_client.connect((tls_server.bind, tls_server.port))
+            try:
+                tool.connect_device(device, tls_client)
+                _bring_up(device, tls_client, tls_server)
+                frame = _arm_and_capture_one(device, tls_client, tls_server)
+            finally:
+                tls_client.close()
+        finally:
+            tls_server.stop()
+    finally:
+        device.disconnect()
 
-        valid_psk = check_psk(device)
-        print(f"Valid PSK: {valid_psk}")
+    tool.write_pgm(frame, SENSOR_WIDTH, SENSOR_HEIGHT, "capture.pgm")
+    preview.preview_stream([frame], SENSOR_WIDTH, SENSOR_HEIGHT, max_frames=1)
 
-        if firmware == previous_firmware:
-            raise ValueError("Unchanged firmware")
 
-        previous_firmware = firmware
+def live_capture(product: int, max_frames: int | None = None, psk_file: str = ""):
+    """Same as single_shot_capture, but keeps re-arming and capturing frames
+    into the live preview: place your finger again each time it prints
+    "Waiting for finger...". Stops when the preview window is closed, or
+    after max_frames if given. Saves the last captured frame to capture.pgm
+    when max_frames bounds the run (skipped for an open-ended live session).
+    """
+    device = init_device(product)
+    last_frame: list = []
+    try:
+        device.nop()
+        psk = _verify_and_get_psk(device, psk_file)
 
-        if re.fullmatch(TARGET_FIRMWARE, firmware):
-            if not valid_psk:
-                erase_firmware(device)
-                continue
+        tls_server = TLSServer(psk=psk.hex()).start()
+        try:
+            tls_client = socket.socket()
+            tls_client.connect((tls_server.bind, tls_server.port))
+            try:
+                tool.connect_device(device, tls_client)
+                _bring_up(device, tls_client, tls_server)
 
-            run_driver(device)
-            return
+                def frames():
+                    count = 0
+                    while max_frames is None or count < max_frames:
+                        frame = _arm_and_capture_one(device, tls_client, tls_server)
+                        last_frame[:] = [frame]
+                        yield frame
+                        count += 1
 
-        if re.fullmatch(VALID_FIRMWARE, firmware):
-            erase_firmware(device)
-            continue
+                preview.preview_stream(
+                    frames(), SENSOR_WIDTH, SENSOR_HEIGHT, max_frames=max_frames)
+            finally:
+                tls_client.close()
+        finally:
+            tls_server.stop()
+    finally:
+        device.disconnect()
 
-        if re.fullmatch(IAP_FIRMWARE, firmware):
-            if not valid_psk:
-                if not write_psk(device):
-                    raise ValueError("Failed to write PSK")
-
-            update_firmware(device)
-
-            device = init_device(product)
-
-            continue
-
-        raise ValueError(
-            "Invalid firmware\n" +
-            tool.warning("Please consider that removing this security "
-                         "is a very bad idea!"))
+    if max_frames is not None and last_frame:
+        tool.write_pgm(last_frame[0], SENSOR_WIDTH, SENSOR_HEIGHT, "capture.pgm")
 
 
 def cli(product: int):
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--allow-write",
+        "--live",
         action="store_true",
-        help="run the legacy destructive firmware path after confirmation",
+        help="repeatedly wait for a finger and show captured frames live "
+             "(read-only PSK use, no device writes)",
     )
-    parser.add_argument("--confirm")
-    parser.add_argument("--stock-dump-sha256")
-    parser.add_argument("--firmware-family", default="52xd")
-    parser.add_argument("--psk-evidence", action="store_true")
     parser.add_argument(
-        "--read-only",
-        action="store_true",
-        default=True,
-        help="run safe firmware/OTP diagnostics only",
+        "--psk-file",
+        default=None,
+        help="32-byte raw PSK file (recovered with tools/psk.py); required "
+             "for --live, verified against the device hash readback",
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=None,
+        help="--live: stop after this many frames instead of running until "
+             "the preview window is closed",
     )
     args = parser.parse_args()
 
-    if args.allow_write:
-        build_flash_plan(
-            product=product,
-            firmware_family=args.firmware_family,
-            target=f"27c6:{product:04x}",
-            stock_dump_sha256=args.stock_dump_sha256 or "",
-            confirmation=args.confirm or "",
-            psk_evidence=args.psk_evidence,
-            operations=("erase_firmware", "write_psk", "update_firmware"),
-        )
-        set_safety_plan(
-            SafetyPlan(
-                target=f"27c6:{product:04x}",
-                allow_write=True,
-                confirmation=args.confirm,
-                stock_dump_sha256=args.stock_dump_sha256,
-                firmware_family=args.firmware_family,
-                psk_evidence=args.psk_evidence,
-                operations=("erase_firmware", "write_psk", "update_firmware"),
-            )
-        )
-        main(product)
+    if args.live:
+        assert args.psk_file
+        code = random.randint(0, 9999)
+        if input(f"Type {code} to continue and start the live capture: "
+                 ) != str(code):
+            print("Abort")
+            return
+        live_capture(product, max_frames=args.frames, psk_file=args.psk_file)
         return
 
     print(json.dumps(read_only_probe(product), indent=2, sort_keys=True))

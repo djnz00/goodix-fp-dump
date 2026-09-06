@@ -9,6 +9,12 @@ Raw captures can contain biometric image data, provisioning state, and PSK
 material. Keep the raw `C:\goodix-capture` output and imported archive artifacts
 out of git unless they have been explicitly scrubbed.
 
+**If you only need the PSK, try `psk_recovery.md` first.** The sealed blob can
+be read off the device and unsealed offline against a mounted Windows volume:
+no Windows boot, no injection. This document is the fallback for when that route
+is blocked: BitLocker, a wiped or reinstalled Windows, or a sensor moved to
+another machine. It is also still the reference for the capture path itself.
+
 ## Windhawk Mod
 
 The Windhawk mod is `tools/windhawk_goodix_winusb_dump.wh.cpp`. It targets the
@@ -16,22 +22,23 @@ The Windhawk mod is `tools/windhawk_goodix_winusb_dump.wh.cpp`. It targets the
 UMDF driver host. Install or paste the mod into Windhawk, enable it for
 `WUDFHost.exe`, then exercise Windows Hello enrollment or verification.
 
-The mod writes JSONL metadata and buffer dumps under:
+The mod hooks exactly two `WBDI.DLL` internal functions
+(`PresetPskPskGet`, `PresetPskPskSet`, see "WBDI Internal Hooks" below) and
+writes the 32-byte session PSK to:
 
 ```text
-C:\goodix-capture\windhawk-winusb\events.jsonl
-C:\goodix-capture\windhawk-winusb\buffers\*.bin
-C:\goodix-capture\windhawk-winusb\buffers\*.hex
+C:\goodix-capture\psk32.bin
 ```
-
-Each event records the source API, direction, pipe or synthetic pipe ID, IOCTL
-code or WBDI command tag, requested length, actual length, status, and paths to
-the binary and hex buffer artifacts.
 
 Disable the mod after collection and exclude `WUDFHost.exe` from further
 Windhawk injection before returning Windows to normal use.
 
-## Capture Attempts
+## Capture Attempts (history)
+
+This section documents how the WBDI-level hook point was found; the layers it
+describes below (USBPcap, WinUSB export hooks, IOCTL/completion interception)
+are no longer part of the shipped mod, which now implements only the WBDI PSK
+hooks this investigation led to.
 
 The first Windows capture attempts used USBPcap and Goodix driver logs. USBPcap
 was useful for device enumeration and controller selection, but on this system
@@ -75,62 +82,69 @@ Goodix driver had assembled or decrypted them.
 
 ## WBDI Internal Hooks
 
-The mod currently hooks two internal `WBDI.DLL` functions by RVA for the driver
-version used during this analysis:
+The mod hooks two internal `WBDI.DLL` functions by RVA for the driver version
+used during this analysis, both of which write `psk32.bin`:
 
-- `Wbdi!IoHubExec` at RVA `0x5c550`
-- `Wbdi!PresetPskPskGet` at RVA `0x78658`
+- `Wbdi!PresetPskPskGet` at RVA `0x78658` -> writes psk32.bin (fallback path)
+- `Wbdi!PresetPskPskSet` at RVA `0x787CC` -> writes psk32.bin (primary path)
 
 These offsets are version-specific. Re-check them after a driver update before
 trusting the capture.
 
-`Wbdi!IoHubExec` receives command objects with a work type, command ID, outbound
-buffer, inbound buffer, and completion status. Capturing around this function
-finally exposed the driver-level messages that the lower hooks missed:
-
-- `0xd0 REQUEST_TLS_CONNECTION` with a two-byte zero payload before TLS starts.
-- Outbound TLS records on WBDI work type `5`.
-- `0x20 MCU_GET_IMAGE` requests with 10-byte calibration payloads.
-- `0x20` image replies with 10240-byte payloads.
-- `0xd2` command-level replies with 10240-byte payloads.
-- Sensor setup and FDT commands such as `0x80`, `0x36`, `0x32`, `0x34`,
-  `0xc4`, `0xd6`, `0x90`, and `0xac`.
-
-The WBDI layer is therefore the most useful place to understand command
-semantics, while the IOCTL layer is useful for correlating those commands to the
-actual driver-host transport behavior.
+An earlier revision of the mod also hooked `Wbdi!IoHubExec` (RVA `0x5c550`) to
+capture command/TLS buffers for protocol reverse-engineering
+(`0xd0 REQUEST_TLS_CONNECTION`, `0x20 MCU_GET_IMAGE`, sensor/FDT commands,
+etc). That hook and its buffer capture output are not needed for PSK
+extraction and have been removed from the shipped mod; see git history if
+protocol-level capture is needed again.
 
 ## PSK Capture
 
-The TLS PSK was captured by hooking `Wbdi!PresetPskPskGet`. After the original
-function returned successfully, the hook copied the output buffer indicated by
-the function's output-length argument. The mod writes that buffer as a
-`wbdi_psk` event with synthetic pipe ID `0xfa` and tag `0x50534b00`.
+Two hooks cover the session PSK, both writing to `C:\goodix-capture\psk32.bin`
+(owner + administrators only) with length-only logging: the mod produces no
+other output file, and the secret never enters the Windhawk log:
 
-The observed buffer was exactly 32 bytes. The analysis summary records only the
-length and SHA-256 of the captured PSK; the raw value remains in the controlled
-archive buffer artifact. Do not commit or print the raw PSK. For local
-experiments, derive `LIBFPRINT_GOODIXTLS_PSK_HEX` from the raw `wbdipsk` buffer
-inside the private archive, then clear it from shell history and logs.
+- `Wbdi!PresetPskPskSet @ 0x787CC` (primary, deterministic): after the original
+  stores the driver-verified plaintext PSK in the session ctx, the hook
+  re-reads it via the original `PskGet` (pure memcpy-from-ctx, no device I/O)
+  into a stack buffer it zeroes after writing. Immune to the ~200ms
+  `PskSet -> PskGet` race; needs only the `PskSet` call itself.
+- `Wbdi!PresetPskPskGet @ 0x78658` (fallback): post-return copy as before.
 
-The captured PSK hashes to the known 52xd/10034 PMK hash used as validation
-evidence. The PMK hash is not itself the OpenSSL TLS PSK; it only confirms that
-the captured 32-byte secret is the Windows driver PSK for the stock 10034 path.
+Expect `PSK captured via PskSet: len 32` (or `PSK captured: len 32`) in the
+Windhawk log, then `psk32.bin` at exactly 32 bytes.
+
+Verify by length only, then hand `psk32.bin` to the libsecret installer and
+delete the file from both sides immediately after. Do not commit or print the
+raw PSK. Validate out-of-band that the installed 32-byte secret matches the
+known 52xd/10034 PMK hash; the PMK hash is not itself the OpenSSL TLS PSK, it
+only confirms the captured secret is the Windows driver PSK for the stock
+10034 path.
 
 ## Practical Workflow
 
-1. Start from a clean `C:\goodix-capture` directory.
-2. Enable the Windhawk mod for `WUDFHost.exe`.
-3. Restart the Windows biometric service or reconnect the reader so the Goodix
-   UMDF host loads with the hook installed.
-4. Exercise Windows Hello enrollment or verification.
-5. Stop after Windows returns to an idle state.
-6. Disable the mod and exclude `WUDFHost.exe` from Windhawk injection.
-7. Import `C:\goodix-capture` into the private `arc/` archive.
-8. Summarize sensitive artifacts by length and hash only.
+Ordering matters more than anything else: the 521D host runs
+`ProcessPsk -> PskSet -> PskGet` once per host lifetime (~200ms after start,
+pre-login), while Windhawk starts at user login. A boot-first capture always
+misses it. Always force the fresh session *after* Windhawk is up:
 
-The important lesson from the capture sequence is that no single layer was
-sufficient. USBPcap and WinUSB hooks gave little or no receive data, async
-completion interception still missed the large returned buffers, and the final
-usable trace required both low-level IOCTL capture and high-level WBDI command
-interception.
+1. Start from a clean `C:\goodix-capture` directory.
+2. Enable the Windhawk mod for `WUDFHost.exe` and confirm Windhawk is running.
+3. Force a fresh observed session: admin PowerShell
+   `tools\goodix-fresh-session.ps1` (restarts `WbioSrvc`, reports the new host
+   pid; fallback is Device Manager disable/enable on the Goodix device).
+4. Confirm the Windhawk log shows both `hooked internal` lines for the new pid.
+   If either is missing, stop; the session will not yield a PSK.
+5. Exercise Windows Hello enrollment or verification once.
+6. Stop after Windows returns to an idle state.
+7. Expect `C:\goodix-capture\psk32.bin` at exactly 32 bytes.
+8. Disable the mod and exclude `WUDFHost.exe` from Windhawk injection.
+9. Hand `psk32.bin` to `tools/goodix_521d_psk.py --store --psk-file`, then
+   delete the file from both sides (see "PSK Capture" above).
+
+The capture investigation (see "Capture Attempts"
+above) showed no single layer was sufficient to find the PSK hook point:
+USBPcap and WinUSB hooks gave little or no receive data, async completion
+interception still missed the large returned buffers, and the final usable
+hook point required high-level WBDI command interception. The shipped mod
+only needs the two WBDI PSK hooks that investigation found.

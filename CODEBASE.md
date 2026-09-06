@@ -1,60 +1,58 @@
 ## Summary
 
-Research conducted on 2026-05-23 and refreshed for the `goodix-fp-dump` checkout on branch `stabilize-goodix-interoperability`. No `source.yaml` was present in this repository, so this report uses a fresh repository source inventory of Python, shell, Lua, Markdown, requirements, logs metadata, and firmware submodule metadata. The project is a Python 3.10+ collection of Goodix fingerprint sensor tools. Top-level `run_<device>.py`, `dump_<device>.py`, and `flash_<device>.py` files dispatch into device-family driver modules. Shared legacy transport, protocol, image, and firmware helpers live in `protocol.py`, `goodix.py`, `wrapless.py`, `tool.py`, `preprocessor.py`, `dumper_53x5.py`, and `flasher_53x5.py`; new phase work lives in the `goodix_fp_dump/` package.
+Inventory refreshed 2026-09-07 for the `goodix-fp-dump` checkout on branch `psk-tooling-cleanup`. The project is a Python 3.10+ collection of Goodix fingerprint sensor tools, targeting the 521d (`27c6:521d`, stock `APP_10034`) only; the other device families (51x0, 51x7, 53x5, 53xd, 5503, 55x4) were removed from the tree. `driver_52xd.py` is the driver flow, `run_521d.py` the hardware entrypoint, and `tools/psk.py` the single-command PSK recovery tool. Shared transport, protocol, image, and firmware helpers live in `protocol.py`, `goodix.py`, `wrapless.py`, `tool.py`, and `preprocessor.py`; shared services live in the `goodix_fp_dump/` package.
+
+Environment management is uv-only: `uv sync` from `pyproject.toml` + `uv.lock`, run anything through `uv run`.
 
 ## Coding style and conventions
 
-The legacy code uses plain Python modules, while the stabilization branch adds a small `goodix_fp_dump/` package for shared archive, preflight, firmware, image, safety, and TLS-proxy services. Device-family modules are named by product family, such as `driver_52xd.py`, `driver_53x5.py`, and `driver_55x4.py`; entrypoints are thin files named for product IDs, such as `run_521d.py` and `run_5395.py`. Functions use `snake_case`; protocol constants and byte blobs use uppercase names such as `PSK`, `DEVICE_CONFIG`, and `FIRMWARE_CHUNK_SIZE` (`driver_52xd.py:17`, `wrapless.py:15`). New modules use type annotations where useful. Indentation is 4 spaces.
+Legacy code uses plain Python modules; the `goodix_fp_dump/` package holds shared archive, preflight, firmware, image, safety, and TLS-proxy services. Functions use `snake_case`; protocol constants and byte blobs use uppercase names such as `PSK`, `DEVICE_CONFIG`, and `PMK_HASH_LENGTH` (`driver_52xd.py`). New modules use type annotations where useful. Indentation is 4 spaces. Fail-closed checks in the 52xd path use plain asserts (verification_status history records the earlier custom-message style as superseded).
 
-## Detailed Findings
+## Detailed findings
 
-### Entrypoints and device dispatch
+### Entrypoint and PSK tooling
 
-The README documents interactive use through product-specific scripts after creating a virtual environment and installing `requirements.txt` (`README.md:11`). `run_521d.py` imports `driver_52xd`, while `run_538d.py` and `run_532d.py` import `driver_53xd`; `run_5395.py` and `run_5385.py` import `driver_53x5`. The scripts provide the device-specific product selection layer and delegate behavior to `main(product)` functions in their driver modules (`driver_52xd.py:314`, `driver_53xd.py:271`, `driver_53x5.py:479`).
+`run_521d.py` calls `driver_52xd.cli(0x521d)`. Default mode is a read-only probe (no PSK needed); `--live --psk-file FILE` runs live capture, where the PSK file is verified against the device's live hash readback before use (`driver_52xd.py`, `_verify_and_get_psk`). `tools/psk.py` recovers the PSK in one command: sealed blob off the device, DPAPI unseal against `--mount`, `sha256` verified against a fresh device readback, then written `0600`. No hardcoded unit hash exists anywhere; the device is the oracle (`tools/psk_recovery.md`).
 
 ### USB, SPI, and message protocol layers
 
-`protocol.py` defines an abstract `Protocol` interface with `write`, `read`, and `disconnect` methods (`protocol.py:10`). `USBProtocol` locates and communicates with USB devices (`protocol.py:29`, `protocol.py:108`, `protocol.py:118`), while `SPIProtocol` handles SPI transfers (`protocol.py:147`, `protocol.py:159`). `goodix.py` provides classic Goodix message packing, checksum, ACK, MCU, firmware, register, TLS-request, and PSK command helpers (`goodix.py:45`, `goodix.py:88`, `goodix.py:146`, `goodix.py:699`, `goodix.py:788`). `wrapless.py` provides another message layer with `Message`, `Device`, and `GTLSContext` abstractions (`wrapless.py:19`, `wrapless.py:74`, `wrapless.py:596`).
+`protocol.py` defines an abstract `Protocol` interface with `write`, `read`, and `disconnect` methods. `USBProtocol` locates and communicates with USB devices; `SPIProtocol` handles SPI transfers. `goodix.py` provides classic Goodix message packing, checksum, ACK, MCU, firmware, register, TLS-request, and PSK command helpers. `wrapless.py` provides another message layer with `Message`, `Device`, and `GTLSContext` abstractions.
 
-### Device-family drivers
+### 52xd driver
 
-Classic family drivers `driver_51x0.py`, `driver_51x0_spi.py`, `driver_51x7.py`, `driver_52xd.py`, `driver_53xd.py`, `driver_5503.py`, and `driver_55x4.py` share a structure: constants for PSK/configuration data, `init_device`, `check_psk`, `write_psk`, `erase_firmware`, `update_firmware`, `run_driver`, and `main` (`driver_52xd.py:46`, `driver_52xd.py:54`, `driver_52xd.py:65`, `driver_52xd.py:76`, `driver_52xd.py:80`, `driver_52xd.py:116`). `driver_53x5.py` uses `wrapless.Device`, dataclass calibration parameters, OTP hash helpers, configuration checksum helpers, base image generation, FDT operations, and finger up/down waits (`driver_53x5.py:97`, `driver_53x5.py:204`, `driver_53x5.py:276`, `driver_53x5.py:365`, `driver_53x5.py:462`).
+`driver_52xd.py` carries read-only probing, single-shot capture, and live capture. There is no PSK write, firmware erase, or flash path: the write path was unreachable behind a `raise` and has been removed, and the old `check_psk`/`write_psk`/`erase_firmware`/`update_firmware`/`run_driver`/`main` family-driver skeleton is gone along with the other families. The libsecret lookup is gone too; the PSK comes from a file (`--psk-file`) verified against the device hash readback.
 
-### Firmware dump, flash, and image tools
+### Image and shared services
 
-`dumper_53x5.py` reads IAP/app firmware, parses flash metadata, dumps OTP, USB PID, and option bytes (`dumper_53x5.py:18`, `dumper_53x5.py:29`, `dumper_53x5.py:50`, `dumper_53x5.py:104`, `dumper_53x5.py:116`). `flasher_53x5.py` provides a firmware update entrypoint (`flasher_53x5.py:8`). `tool.py` contains console warnings, TLS socket connection bridging, PGM image encode/decode helpers, and image file IO (`tool.py:7`, `tool.py:12`, `tool.py:36`, `tool.py:49`, `tool.py:61`). `preprocessor.py` implements crop, threshold, histogram, mean-filter, subtraction, and histogram equalization operations with a CLI (`preprocessor.py:6`, `preprocessor.py:14`, `preprocessor.py:28`, `preprocessor.py:51`, `preprocessor.py:104`).
-
-### Stabilization package and tests
-
-`goodix_fp_dump/archive.py` creates controlled run directories and manifests. `device_info.py` records system and USB preflight facts. `firmware.py` and `safety.py` implement compatibility checks and destructive-operation gates. `image.py` validates image buffers before decoding, and `tls_proxy.py` wraps `openssl s_server` lifecycle management. Tests under `tests/` cover archive creation, preflight collection, OTP classification, safety gates, firmware compatibility, flash plans, image validation, TLS cleanup, and marker-based hardware/flash/manual skips. Default tests must not require hardware.
+`tool.py` contains console warnings, TLS socket connection bridging, PGM image encode/decode helpers, and image file IO. `preprocessor.py` implements crop, threshold, histogram, mean-filter, subtraction, and histogram equalization operations with a CLI. `goodix_fp_dump/archive.py` creates controlled run directories and manifests; `device_info.py` records system and USB preflight facts; `firmware.py` and `safety.py` implement compatibility checks and destructive-operation gates; `image.py` validates image buffers before decoding; `tls_proxy.py` wraps `openssl s_server` lifecycle management; `production.py` and `cli.py` provide the production-read variants probe. Tests under `tests/` cover archive creation, preflight collection, OTP classification, safety gates, firmware compatibility, flash plans, image validation, TLS cleanup, and marker-based hardware/flash/manual skips. Default tests must not require hardware.
 
 ### Phase 8 Goodix 521d findings
 
-Windows driver analysis of `Wbdi.dll` shows that `PresetPskReadSpecDataR` sends command `0xe4` with an 8-byte `{selector, 0}` request and expects a response shaped as `status + selector + length + payload`. The older Linux helper sends `length + offset + selector + 0`, so the stabilization package now includes `read-production-variants` to probe both layouts without printing raw production data. A 2026-05-23 hardware run against `27c6:521d` archived under `arc/20260523T212126Z-27c6-521d` returned the clean MCU negative `0x01 0x00` for all read variants and selectors.
+Windows driver analysis of `Wbdi.dll` shows that `PresetPskReadSpecDataR` sends command `0xe4` with an 8-byte `{selector, 0}` request and expects a response shaped as `status + selector + length + payload`. The older Linux helper sends `length + offset + selector + 0`, so the package includes `read-production-variants` (`goodix_fp_dump/cli.py`) to probe both layouts without printing raw production data. A 2026-05-23 hardware run against `27c6:521d` returned the clean MCU negative `0x01 0x00` for all read variants and selectors; the later finding (2026-09-05) is that the 16-byte request form succeeds under stock `APP_10034`, which is what `tools/psk.py` uses.
 
-The same Windows path has a separate provisioning branch: when PSK validation fails, `PresetPskWriteKey` generates a random 32-byte PSK, stores a host-sealed `0xbb010002` TLV plus a whitebox-encrypted `0xbb010003` TLV through command `0xe0`, then validates by reading `0xbb020001` or `0xbb020007` before setting the in-memory TLS PSK. The current Linux TLS failure is therefore no longer explained by USB framing or TLS record movement alone; the remaining gap is reproducing the Windows provisioning/validation state machine safely.
+The same Windows path has a separate provisioning branch: when PSK validation fails, `PresetPskWriteKey` generates a random 32-byte PSK, stores a host-sealed `0xbb010002` TLV plus a whitebox-encrypted `0xbb010003` TLV through command `0xe0`, then validates by reading `0xbb020001` or `0xbb020007` before setting the in-memory TLS PSK.
 
 ### Firmware, logs, and Wireshark helpers
 
-The `firmware/` directory is a submodule containing device-family firmware blobs and metadata. `log/README.md` and `log/goodix_enable_logs.reg` document Windows-side logging artifacts. Lua dissectors in `wireshark/` decode Goodix messages for packet analysis; `wireshark/goodix_message.lua` contains protocol command annotations and parsing logic, and `wireshark/wrapless_goodix_message.lua` covers the wrapless message format.
+The `firmware/` directory is a submodule containing firmware blobs and metadata. `log/README.md` and `log/goodix_enable_logs.reg` document Windows-side logging artifacts. Lua dissectors in `wireshark/` decode Goodix messages for packet analysis.
 
-## Code References
+## Code references
 
-- `README.md:11` - Setup and run commands for the tool collection.
-- `requirements.txt:1` - Runtime dependencies including `pyusb`, `crcmod`, `python-periphery`, `spidev`, `pycryptodome`, and `crccheck`.
-- `protocol.py:10` - Abstract protocol interface.
-- `goodix.py:146` - Classic Goodix `Device` command wrapper.
-- `wrapless.py:74` - Wrapless `Device` command wrapper.
-- `wrapless.py:596` - GTLS context and handshake handling.
-- `driver_52xd.py:116` - 52xd driver runtime flow.
-- `driver_53x5.py:479` - 53x5 main entrypoint.
-- `dumper_53x5.py:18` - 53x5 firmware dump flow.
+- `README.md` - setup (uv), run commands, project layout.
+- `tools/psk.py` - one-command PSK recovery (device -> DPAPI -> verify -> file).
+- `tools/psk_recovery.md` - the recovery walkthrough, chain, and scope warnings.
+- `protocol.py` - abstract protocol interface, USB and SPI transports.
+- `goodix.py` - classic Goodix `Device` command wrapper.
+- `wrapless.py` - wrapless `Device` wrapper and GTLS context.
+- `driver_52xd.py` - 52xd driver runtime flow (probe, capture, PSK self-check).
+- `goodix_fp_dump/cli.py` - production-read variants probe and other subcommands.
 
-## Architecture Documentation
+## Open questions
 
-The project architecture remains script-driven for compatibility. Product-specific entrypoints choose a driver module and product ID. Driver modules open a transport through `protocol.py`, wrap that transport with either `goodix.Device` or `wrapless.Device`, then execute sensor initialization, PSK checks/writes, firmware operations, configuration upload, FDT scanning, and image handling. New shared services in `goodix_fp_dump/` provide testable archive, preflight, TLS, image, firmware, and safety helpers without moving the legacy entrypoints. The firmware submodule supplies binary inputs used by update and flash flows.
+- Hardware-specific execution paths were documented from source plus attended hardware sessions; no automated hardware tests run in CI.
 
-## Open Questions
+## Phase 4 evidence pointers (redacted, 2026-09-03)
 
-- `source.yaml` was not present, so no definitive manifest of intended research files was available.
-- Hardware-specific execution paths were documented from source only; no device scripts were run.
+- Windows capture hook points: `tools/windhawk_goodix_winusb_dump.wh.cpp` (`Wbdi!PresetPskPskGet` at `0x78658`, `Wbdi!IoHubExec` at `0x5c550`; `TlsConfPsk` point disabled as unproven). Event log shape: `<capture-dir>\windhawk-winusb\events.jsonl` with command-out/command-in and IOCTL classes; no persistent provisioning records expected for the cached-credential session.
+- Linux credential scope: the paired driver is a separate repository, [`LuvHakii/libfprint`](https://github.com/LuvHakii/libfprint). `libfprint/drivers/goodixtls/goodix52xd.c` (`goodix52xd_get_tls_psk`) reads exactly one 32-byte PSK from a root-owned file under fprintd's `StateDirectory` (`/var/lib/fprint/<driver-id>-27c6-521d.psk`) and fails closed on missing, malformed, wrong-length or wrong-mode input; libsecret is unreachable because fprintd runs as root on the system bus with no session. `goodix52xd_policy.h` accepts `GFUSB_GM168SEC_APP_10034` only. Policy tests: `tests/test-goodixtls52xd-policy.c` in that repo.
+- Destructive paths: none. libfprint has no persistent PSK, credential-write, or firmware erase/update path, and `driver_52xd.py` no longer carries one. The safety gates in `goodix_fp_dump/safety.py` and `goodix_fp_dump/firmware.py` stay, with their own tests.
