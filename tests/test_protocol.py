@@ -143,7 +143,7 @@ def test_strict_read_only_skips_usb_state_mutations(
     transport = protocol.USBProtocol(0x27C6, 0x521D, strict_read_only=True)
     assert transport.read() == b"\xa0\x01\x00\xa1a"
     transport.disconnect()
-    assert device.calls == []
+    assert device.calls == ["dispose"]
 
 
 def test_usb_read_buffers_truncated_transfer_until_pack_is_complete(

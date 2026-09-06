@@ -166,7 +166,14 @@ class USBProtocol(Protocol):
             self._read_buffer.extend(data)
 
     def disconnect(self, timeout=5):
+        # pyusb claims the interface lazily on the first bulk transfer even in
+        # strict_read_only mode; dropping the handle is the only thing that
+        # releases it, and a later init in the same process needs it back.
         if self.strict_read_only:
+            try:
+                usb.util.dispose_resources(self.device)
+            except usb.core.USBError:
+                pass
             return
         try:
             usb.util.release_interface(self.device, self.interface_number)
