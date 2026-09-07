@@ -11,29 +11,20 @@ Community discussion happens in the Discord channel
 
 ## Current status
 
-This tree is still hardware-facing research software. Default tests and helper
-modules are designed to be safe without a sensor attached, but top-level
-`run_*.py`, `dump_*.py`, and `flash_*.py` scripts talk directly to devices.
-Read the target script before running it.
-
-The 52xd/521d path is kept as a companion diagnostic lane for the libfprint
-`goodixtls52xd` driver. Firmware erase, write, update, and flash flows are
-opt-in only and require explicit hardware/flash test markers or script-level
-confirmation.
+This tree is hardware-facing research software, targeting the 521d
+(`27c6:521d`, stock `APP_10034`) only. The production Linux runtime belongs to
+the paired libfprint `goodixtls52xd` driver.
 
 ## Setup
 
 ```sh
 git submodule update --init --recursive
-python --version # Must be Python 3.10 or newer
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-pip install -r requirements-dev.txt
+uv sync          # Python 3.10+ and uv required
 ```
 
-If you cloned the repository manually, clone with submodules or run the
-submodule command above before using firmware-related tooling.
+`uv sync` creates the project environment from `pyproject.toml` + `uv.lock`
+and installs everything, including dev tools. Run anything with `uv run
+<command>`.
 
 ## Running device scripts
 
@@ -43,23 +34,18 @@ Identify the attached Goodix USB product ID:
 sudo lsusb -vd "27c6:" | grep "idProduct"
 ```
 
-Then choose the matching entrypoint, for example:
+Then choose the matching entrypoint:
 
 ```sh
-sudo -E .venv/bin/python run_521d.py
+sudo -E uv run run_521d.py            # read-only probe (default)
+sudo -E uv run run_521d.py --live --psk-file /path/to/psk.bin   # live capture
 ```
 
-Use the product ID in the script name where available, such as `run_5110.py`,
-`run_521d.py`, `run_538d.py`, `run_5395.py`, or `run_55b4.py`. Dump and flash
-entrypoints are more invasive than run entrypoints; do not run `flash_*.py`
-unless you have a verified restore path for that exact device.
+This tree targets the 521d only (`27c6:521d`, stock `APP_10034`).
 
 ## Project layout
 
-- `run_<device>.py`, `dump_<device>.py`, and `flash_<device>.py` are hardware
-  entrypoints.
-- `driver_52xd.py`, `driver_53xd.py`, `driver_53x5.py`, and related modules
-  contain legacy device-family flows.
+- `run_521d.py` is the hardware entrypoint; `driver_52xd.py` the driver flow.
 - `goodix_fp_dump/` contains shared archive, preflight, firmware, image,
   safety, production-read, USB-reset, Windows-capture, and TLS helper code.
 - `firmware/` is a submodule with firmware data and metadata.
@@ -68,15 +54,20 @@ unless you have a verified restore path for that exact device.
 - `tools/windhawk_goodix_winusb_dump.wh.cpp` and
   `tools/windhawk-goodix-capture.md` document the Windhawk/WBDI capture path
   used to inspect the Windows driver and capture the stock 52xd/10034 TLS PSK
-  into a private archive.
+  into an archive.
+- `tools/psk.py` recovers the 521d TLS PSK in one command (device blob ->
+  DPAPI unseal -> device-hash verify -> file). The 521d ships
+  Windows-provisioned with a random PSK, so it cannot be provisioned from a
+  hardcoded constant. `tools/psk_recovery.md` is the walkthrough and records the
+  scope warning; read it first.
 
 ## Tests and lint
 
 Default validation avoids hardware, flash, and manual tests:
 
 ```sh
-python -m pytest -m "not hardware and not flash and not manual"
-python -m ruff check .
+uv run pytest -m "not hardware and not flash and not manual"
+uv run ruff check .
 ```
 
 Hardware, flash, and manual tests are intentionally opt-in. Enable them only
@@ -88,3 +79,21 @@ operation is acceptable for that machine.
 Raw USB captures, firmware dumps, enrolled-print artifacts, biometric images,
 and local logs should stay out of git. Keep run artifacts in an untracked
 archive directory and scrub logs before sharing them.
+
+## Credits
+
+- [goodix-fp-linux-dev](https://github.com/goodix-fp-linux-dev): the original
+  `goodix-fp-dump` this tree forks. The USB protocol core and the image
+  preprocessor.
+- [djnz00](https://github.com/djnz00): the `goodix_fp_dump/` package.
+  Archive handling, production reads, TLS probe and proxy, Windows capture,
+  firmware metadata, USB reset, and the safety gates.
+- [impacket](https://github.com/fortra/impacket): DPAPI blob and LSA secret
+  decryption behind `tools/psk.py`.
+- [lbssousa](https://github.com/lbssousa): the SIGFM matcher implementation
+  (`libfprint/sigfm/`, from `goodix-538d-sigfm-gtls`), vendored and wired into
+  the paired libfprint driver.
+- [libfprint](https://gitlab.freedesktop.org/libfprint/libfprint): the driver
+  framework the production runtime targets.
+- [Windhawk](https://windhawk.net): mod format and hooking API for the WBDI
+  capture path.

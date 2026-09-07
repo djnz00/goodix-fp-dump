@@ -27,8 +27,9 @@ class Protocol(abc.ABC):
 
 
 class USBProtocol(Protocol):
+    MAX_FRAME_LENGTH = 0x4000
 
-    def __init__(self, vendor, product, timeout=5):
+    def __init__(self, vendor, product, timeout=5, *, strict_read_only=False):
         super().__init__(vendor, product, timeout)
 
         if timeout is not None:
@@ -60,6 +61,8 @@ class USBProtocol(Protocol):
             time.sleep(0.01)
 
         self.device: usb.core.Device = device
+        self.strict_read_only = strict_read_only
+        self._read_buffer = bytearray()
 
         print(f"Found Goodix device: \"{self.device.product}\" "
               f"from \"{self.device.manufacturer}\" "
@@ -91,6 +94,7 @@ class USBProtocol(Protocol):
             raise ConnectionError("Endpoint in not found", -5, 6)
 
         self.endpoint_in: int = endpoint_in.bEndpointAddress
+        self._read_buffer = bytearray()
         print(f"Found endpoint in: {hex(self.endpoint_in)}")
 
         endpoint_out = usb.util.find_descriptor(
@@ -113,13 +117,14 @@ class USBProtocol(Protocol):
         except (NotImplementedError, usb.core.USBError):
             kernel_driver_active = False
 
-        if kernel_driver_active:
+        if kernel_driver_active and not self.strict_read_only:
             self.device.detach_kernel_driver(self.interface_number)
             self.detached_kernel_driver = True
 
-        self.device.set_configuration()
-        usb.util.claim_interface(self.device, self.interface_number)
-        self._clear_endpoint_halts()
+        if not self.strict_read_only:
+            self.device.set_configuration()
+            usb.util.claim_interface(self.device, self.interface_number)
+            self._clear_endpoint_halts()
 
     def _clear_endpoint_halts(self):
         for endpoint in (self.endpoint_in, self.endpoint_out):
@@ -141,11 +146,35 @@ class USBProtocol(Protocol):
     def read(self, size=0x10000, timeout=5):
         timeout = 0 if timeout is None else round(timeout * 1000)
 
-        data: bytes = self.device.read(self.endpoint_in, size,
-                                       timeout).tobytes()
-        return data
+        while True:
+            if len(self._read_buffer) >= 4:
+                if sum(self._read_buffer[:3]) & 0xff != self._read_buffer[3]:
+                    raise ValueError("Invalid USB message pack header")
+                payload_length = int.from_bytes(self._read_buffer[1:3],
+                                                byteorder="little")
+                frame_length = 4 + payload_length
+                if frame_length > self.MAX_FRAME_LENGTH:
+                    raise ValueError("USB message pack is too large")
+                if len(self._read_buffer) >= frame_length:
+                    frame = bytes(self._read_buffer[:frame_length])
+                    del self._read_buffer[:frame_length]
+                    return frame
+
+            data = self.device.read(self.endpoint_in, size, timeout).tobytes()
+            if not data:
+                raise ValueError("Truncated USB message pack")
+            self._read_buffer.extend(data)
 
     def disconnect(self, timeout=5):
+        # pyusb claims the interface lazily on the first bulk transfer even in
+        # strict_read_only mode; dropping the handle is the only thing that
+        # releases it, and a later init in the same process needs it back.
+        if self.strict_read_only:
+            try:
+                usb.util.dispose_resources(self.device)
+            except usb.core.USBError:
+                pass
+            return
         try:
             usb.util.release_interface(self.device, self.interface_number)
         except usb.core.USBError as error:
