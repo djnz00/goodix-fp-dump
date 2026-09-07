@@ -38,6 +38,7 @@ MASTER_KEY_ROOTS = (
     'Windows/ServiceProfiles/*/AppData/Roaming/Microsoft/Protect',
 )
 
+PRODUCT = 0x521d          # the only family with a per-device random PSK
 SEALED_SEL = 0xbb010002   # the sealed PSK TLV itself
 SEALED_LEN = 324          # GfUnsealData:0246 logs "324, 32" on this unit
 HASH_SEL = 0xbb020001     # SHA-256(PSK), the device-side verification oracle
@@ -146,10 +147,9 @@ def main():
     ap.add_argument('--out', required=True,
                     help='PSK destination, written 0600 only on hash match')
     ap.add_argument('--mount', required=True, help='mounted Windows root')
-    ap.add_argument('--product', default='0x521d')
     args = ap.parse_args()
 
-    device = driver_52xd.init_device(int(args.product, 0), strict_read_only=True)
+    device = driver_52xd.init_device(PRODUCT, strict_read_only=True)
     try:
         sealed, err = device_read(device, SEALED_SEL, SEALED_LEN)
         assert not err and sealed
@@ -190,7 +190,7 @@ def main():
     assert len(plain) == PSK_LEN
     recovered_hash = hashlib.sha256(plain).digest()
 
-    device = driver_52xd.init_device(int(args.product, 0), strict_read_only=True)
+    device = driver_52xd.init_device(PRODUCT, strict_read_only=True)
     try:
         device_hash, err = device_read(device, HASH_SEL, HASH_LEN)
         assert not err and device_hash
